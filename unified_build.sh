@@ -43,8 +43,13 @@ OS="$(uname -s)"
 if [ "$OS" == "Darwin" ]; then
     echo "[*] macOS detected."
     echo "[*] Note: Official Mamba CUDA kernels are not supported on Mac."
-    echo "[*] The system will use the MockMamba2 fallback (GRU-based)."
-    echo "[*] Skipping mamba-ssm compilation to avoid errors."
+    echo "[*] Installing mamba-ssm with MAMBA_SKIP_CUDA_BUILD=TRUE to enable CPU/MPS fallback..."
+    
+    cd "$MAMBA_DIR"
+    export MAMBA_SKIP_CUDA_BUILD=TRUE
+    pip3 install -e .
+    cd "$SCRIPT_DIR"
+    
     echo "[+] Setup complete for Mac."
 else
     echo "[*] Linux/Other OS detected. Attempting to build Mamba CUDA kernels..."

@@ -184,6 +184,9 @@ class PPOTrainer:
             "mem_modes": state["mem"].modes.detach().clone(),     # (B, K, D)
             "mem_usage": state["mem"].usage.detach().clone(),     # (B, K)
         }
+        
+        # Track final memory usage for logging
+        final_mem_usage = None
 
         for t in range(T):
             # Mask recurrent + memory state where previous step was done
@@ -229,6 +232,7 @@ class PPOTrainer:
         # Bootstrap value for GAE
         with torch.no_grad():
             logits, next_value, _, _, _ = self.agent(obs, state)
+            final_mem_usage = state["mem"].usage.detach().clone()
 
         rollout_data = {
             "obs": obs_buf,               # (T, B, obs_dim)
@@ -245,6 +249,7 @@ class PPOTrainer:
             "ep_returns": completed_returns,
             "ep_lengths": completed_lengths,
             "init_state": init_state,
+            "final_mem_usage": final_mem_usage,
         }
         return rollout_data, info
 
@@ -439,7 +444,7 @@ class PPOTrainer:
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            nn.utils.clip_grad_norm_(self.agent.parameters(), args.max_grad_norm)
+            grad_norm = nn.utils.clip_grad_norm_(self.agent.parameters(), args.max_grad_norm)
             self.optimizer.step()
 
             approx_kl = 0.5 * (log_ratio.pow(2).mean()).item()
@@ -454,6 +459,7 @@ class PPOTrainer:
             "loss/entropy": entropy_loss,
             "loss/gate": gate_loss,
             "stats/approx_kl": approx_kl,
+            "stats/grad_norm": grad_norm.item(),
         }
         return metrics
 
@@ -513,6 +519,12 @@ class PPOTrainer:
                 "train/step": self.global_step,
             }
             log_data.update(metrics)
+            
+            # Log memory usage histogram if available
+            if "final_mem_usage" in info and info["final_mem_usage"] is not None:
+                mem_usage = info["final_mem_usage"].flatten().cpu().numpy()
+                log_data["train/mem_usage_hist"] = wlog.wandb.Histogram(mem_usage)
+
             wlog.log_metrics(self.global_step, log_data, run=self.run)
 
         wlog.finish_wandb(self.run)

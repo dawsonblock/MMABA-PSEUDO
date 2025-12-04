@@ -21,27 +21,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    from mamba_compat import patch_mamba_for_cpu
+    patch_mamba_for_cpu()
     from mamba_ssm.modules.mamba2 import Mamba2
 except ImportError:
-    print("Warning: mamba_ssm not found. Using MockMamba2 (GRU-based) for compatibility.")
-    
-    class MockMamba2(nn.Module):
-        """
-        Mock Mamba2 that uses a GRU to match the interface (B, L, D) -> (B, L, D).
-        This allows the code to run on Mac/CPU without the real Mamba kernel.
-        """
-        def __init__(self, d_model, d_state=16, d_conv=4, expand=2, **kwargs):
-            super().__init__()
-            self.d_model = d_model
-            # Mamba usually expands dimension internally, but for mock we just map d_model -> d_model
-            self.gru = nn.GRU(d_model, d_model, batch_first=True)
-            
-        def forward(self, x):
-            # x: (B, L, D)
-            out, _ = self.gru(x)
-            return out
-
-    Mamba2 = MockMamba2
+    print("Error: mamba_ssm not found. Please install it or check your environment.")
+    Mamba2 = None
 
 
 # ============================================================
