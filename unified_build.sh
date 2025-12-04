@@ -24,8 +24,13 @@ pip3 install torch numpy wandb
 echo "[+] Root dependencies installed."
 
 # 2. Check for Mamba directory
-if [ ! -d "$MAMBA_DIR" ]; then
-    echo "[-] Error: mamba-main directory not found at $MAMBA_DIR"
+if [ -d "$MAMBA_DIR" ]; then
+    echo "[*] Found mamba-main at $MAMBA_DIR"
+elif [ -d "$SCRIPT_DIR/../mamba-main" ]; then
+    MAMBA_DIR="$SCRIPT_DIR/../mamba-main"
+    echo "[*] Found mamba-main at $MAMBA_DIR"
+else
+    echo "[-] Error: mamba-main directory not found at $MAMBA_DIR or ../mamba-main"
     exit 1
 fi
 
