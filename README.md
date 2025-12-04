@@ -23,16 +23,16 @@ It is designed to be a drop-in benchmark suite for testing memory capabilities i
     ```
 
 2.  **Install Dependencies**:
+    We provide a unified build script that handles dependencies and Mamba installation (or fallback) automatically.
     ```bash
-    pip install torch numpy wandb
+    ./unified_build.sh
     ```
 
-3.  **(Optional) Install Mamba**:
-    For optimal performance on CUDA-enabled Linux systems, install the official Mamba kernels:
+    *Alternatively, you can install manually:*
     ```bash
-    pip install mamba-ssm
+    pip install torch numpy wandb
+    # Optional: pip install mamba-ssm
     ```
-    *Note: On macOS, this step is optional. The code will use the MockMamba fallback if `mamba_ssm` is missing.*
 
 ## Usage
 
