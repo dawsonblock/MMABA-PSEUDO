@@ -1,0 +1,495 @@
+Mr Block, here is the exact integration, end-to-end.
+
+You install Mamba once as a library, then drop a single new file (mem_actor_critic_mamba.py) into your neural-memory repo and change one import.
+
+⸻
+
+1. One-time: install Mamba as a library
+
+If your ZIP is a clone of the official repo, do this on the machine you train on (Linux with CUDA is safest):
+
+cd /path/to/Mamba           # folder from "Mamba .zip"
+pip install -e .
+pytest tests/ops/test_selective_scan.py -q
+
+After that:
+	•	mamba_ssm is an installed package.
+	•	The CUDA op selective_scan_cuda is built.
+	•	You never touch these files again.
+
+From now on you can just:
+
+from mamba_ssm.modules.mamba2 import Mamba2
+
+inside any project.
+
+⸻
+
+2. Project layout for your neural-memory repo
+
+Assume your memory benchmark repo looks roughly like this:
+
+neural_memory_project/
+  neural_memory_final.py         # already exists (env + old MemActorCritic)
+  neural_memory_long_ppo.py      # PPO trainer we’ve been editing
+  wandb_integration.py
+  requirements.txt
+  ...
+
+You will add:
+
+  mem_actor_critic_mamba.py      # NEW — MemActorCritic with Mamba + pseudomodes
+
+And you will change one import line in neural_memory_long_ppo.py.
+
+⸻
+
+3. New file: mem_actor_critic_mamba.py
+
+Drop this file into neural_memory_project/:
+
+#!/usr/bin/env python3
+"""
+mem_actor_critic_mamba.py
+
+MemActorCritic wired to:
+  - Controller: GRU or Mamba2
+  - External memory: PseudoModeMemory (your pseudomodes)
+
+This is a drop-in replacement for the old MemActorCritic used in
+`neural_memory_long_ppo.py`. PPO code does NOT need to change
+except for the import.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from mamba_ssm.modules.mamba2 import Mamba2
+
+
+# ============================================================
+# Pseudomode Memory (external long-term store)
+# ============================================================
+
+
+@dataclass
+class PseudoModeState:
+    modes: torch.Tensor  # (B, K, D)
+    usage: torch.Tensor  # (B, K)
+
+
+class PseudoModeMemory(nn.Module):
+    """
+    Simple pseudomode-style memory:
+
+    - K "modes" per batch: long-lived vectors of dimension D.
+    - Each write excites one mode selected by low usage.
+    - Read is content-based attention over modes.
+    """
+
+    def __init__(self, num_slots: int, slot_dim: int, decay: float = 0.0):
+        super().__init__()
+        self.num_slots = num_slots
+        self.slot_dim = slot_dim
+        self.decay = decay
+
+        # Project controller state to query / write vectors
+        self.key_proj = nn.Linear(slot_dim, slot_dim)
+        self.write_proj = nn.Linear(slot_dim, slot_dim)
+
+    def initial_state(self, batch_size: int, device: torch.device) -> PseudoModeState:
+        modes = torch.zeros(batch_size, self.num_slots, self.slot_dim, device=device)
+        usage = torch.zeros(batch_size, self.num_slots, device=device)
+        return PseudoModeState(modes=modes, usage=usage)
+
+    def read(self, state: PseudoModeState, query: torch.Tensor) -> Tuple[torch.Tensor, PseudoModeState]:
+        """
+        query: (B, Dh). We treat it as if Dh == slot_dim. If not, you can
+        add a projection before calling this.
+        """
+        B, K, D = state.modes.shape
+        assert query.shape[0] == B
+
+        # Project query into same dimension as modes
+        q = self.key_proj(query)                 # (B, D)
+        q = q.unsqueeze(1)                       # (B, 1, D)
+
+        # Scores: dot product between modes and query
+        scores = torch.einsum("bkd,b1d->bk", state.modes, q)  # (B, K)
+        attn = F.softmax(scores, dim=-1).unsqueeze(-1)        # (B, K, 1)
+
+        read_vec = (attn * state.modes).sum(dim=1)            # (B, D)
+        return read_vec, state
+
+    def write(self, state: PseudoModeState, h: torch.Tensor, gate: torch.Tensor) -> PseudoModeState:
+        """
+        h:    (B, Dh)  — controller state
+        gate: (B,)     — write strength in [0, 1]
+
+        Strategy:
+            - Pick least-used slot per batch.
+            - Decay existing content.
+            - Add new write vector proportional to gate.
+        """
+        modes = state.modes
+        usage = state.usage
+
+        B, K, D = modes.shape
+        assert h.shape[0] == B
+
+        # If Dh != D, you should proj h to D before calling.
+        w = self.write_proj(h)          # (B, D)
+
+        # Slot to write = argmin usage (least excited mode)
+        idx = usage.argmin(dim=-1)      # (B,)
+
+        # In-place updates are fine here since we don't backprop through
+        # the selection logic itself.
+        for b in range(B):
+            k = idx[b]
+            g = gate[b]
+            if g.item() == 0.0:
+                # No write, just optional decay
+                modes[b, k] = modes[b, k] * (1.0 - self.decay)
+            else:
+                modes[b, k] = (1.0 - g) * modes[b, k] * (1.0 - self.decay) + g * w[b]
+                usage[b, k] = usage[b, k] + g
+
+        return PseudoModeState(modes=modes, usage=usage)
+
+
+# ============================================================
+# MemActorCritic: GRU / Mamba + Pseudomodes
+# ============================================================
+
+
+class MemActorCritic(nn.Module):
+    """
+    Actor-Critic with external pseudomode memory.
+
+    Controller options:
+        - "gru"   : GRUCell
+        - "mamba" : Mamba2 (stateless per-step, recurrence is via pseudomodes)
+
+    State dict used by PPO:
+        state = {
+            "h":   (B, hidden_size),
+            "mem": PseudoModeState
+        }
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        action_dim: int,
+        controller_type: str = "gru",
+        hidden_size: int = 128,
+        memory_slots: int = 16,
+        memory_dim: int = 64,
+    ):
+        super().__init__()
+
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.controller_type = controller_type
+        self.hidden_size = hidden_size
+        self.memory_slots = memory_slots
+        self.memory_dim = memory_dim
+
+        # Encode observation to hidden_size
+        self.obs_encoder = nn.Linear(obs_dim, hidden_size)
+
+        # External pseudomode memory (slot_dim = memory_dim)
+        self.memory = PseudoModeMemory(
+            num_slots=memory_slots,
+            slot_dim=memory_dim,
+            decay=0.0,
+        )
+
+        # Controller input is [obs_encoded, mem_read] -> size = hidden_size + memory_dim
+        ctrl_input_dim = hidden_size + memory_dim
+
+        if controller_type == "gru":
+            self.controller = nn.GRUCell(ctrl_input_dim, hidden_size)
+
+        elif controller_type == "mamba":
+            # Mamba2 processes sequences (B, T, D). We'll use T=1 per step.
+            self.controller = Mamba2(
+                d_model=ctrl_input_dim,
+                d_state=16,
+                d_conv=4,
+                expand=2,
+            )
+
+        else:
+            raise ValueError(f"Unknown controller_type: {controller_type}")
+
+        # Gate projector for writes into pseudomodes (scalar per env)
+        self.gate_proj = nn.Linear(hidden_size + memory_dim, 1)
+
+        # Policy + value heads use [controller_output, mem_read] again
+        self.policy_head = nn.Linear(hidden_size + memory_dim, action_dim)
+        self.value_head = nn.Linear(hidden_size + memory_dim, 1)
+
+    # -------------------------------------------------------- #
+
+    def initial_state(self, batch_size: int, device: torch.device) -> Dict[str, object]:
+        """
+        Returns the initial recurrent + memory state for PPO.
+        """
+        h0 = torch.zeros(batch_size, self.hidden_size, device=device)
+        mem0 = self.memory.initial_state(batch_size, device=device)
+        return {"h": h0, "mem": mem0}
+
+    # -------------------------------------------------------- #
+
+    def forward(
+        self,
+        obs: torch.Tensor,              # (B, obs_dim)
+        state: Dict[str, object],       # {"h": (B,H), "mem": PseudoModeState}
+    ):
+        """
+        Single step forward.
+
+        Returns:
+            logits: (B, action_dim)
+            value:  (B,)
+            next_state: {"h": ..., "mem": ...}
+            gate:   (B,)
+            extras: dict (for debug/analysis)
+        """
+        B = obs.shape[0]
+        assert state["h"].shape[0] == B
+
+        # 1) Encode observation
+        x = self.obs_encoder(obs)          # (B, H)
+
+        # 2) Read from pseudomode memory using previous controller state as query
+        read_vec, mem_state = self.memory.read(state["mem"], query=state["h"])  # (B, M), state
+
+        # 3) Controller input = [encoded obs, last memory read]
+        ctrl_in = torch.cat([x, read_vec], dim=-1)   # (B, H+M)
+
+        # 4) Controller update
+        if self.controller_type == "gru":
+            h = self.controller(ctrl_in, state["h"])     # (B, H)
+
+        elif self.controller_type == "mamba":
+            # Mamba2 expects (B, T, D). We treat each step as T=1.
+            ctrl_in_seq = ctrl_in.unsqueeze(1)           # (B, 1, H+M)
+            h_seq = self.controller(ctrl_in_seq)         # (B, 1, H+M)
+            h_full = h_seq.squeeze(1)                    # (B, H+M)
+
+            # Split back into (H, M) chunks: first H dims = new h, last M dims reused for mem interface
+            h = h_full[:, : self.hidden_size]
+            read_vec = h_full[:, self.hidden_size : self.hidden_size + self.memory_dim]
+        else:
+            raise RuntimeError("Invalid controller_type at runtime")
+
+        # 5) Compute gate for pseudomode write
+        gate = torch.sigmoid(self.gate_proj(torch.cat([h, read_vec], dim=-1))).squeeze(-1)  # (B,)
+
+        # 6) Write into pseudomodes
+        mem_state = self.memory.write(mem_state, h=h, gate=gate)
+
+        # 7) Policy + value from [h, read_vec]
+        joint = torch.cat([h, read_vec], dim=-1)    # (B, H+M)
+        logits = self.policy_head(joint)            # (B, action_dim)
+        value = self.value_head(joint).squeeze(-1)  # (B,)
+
+        next_state = {"h": h, "mem": mem_state}
+        extras = {
+            "read_vec": read_vec,
+        }
+
+        return logits, value, next_state, gate, extras
+
+Key points:
+	•	MemActorCritic.initial_state returns {"h", "mem"} — same shape your PPO already expects.
+	•	For controller_type="mamba", we use Mamba2 as a per-step sequence layer (T=1), and let pseudomodes carry the long-term memory.
+	•	No changes needed in PPO’s state handling beyond this class.
+
+⸻
+
+4. Update neural_memory_long_ppo.py import
+
+At the top of neural_memory_long_ppo.py you currently have something like:
+
+from neural_memory_final import make_env, MemActorCritic
+
+Change it to:
+
+from neural_memory_final import make_env
+from mem_actor_critic_mamba import MemActorCritic
+
+Nothing else in PPO needs to change.
+	•	It still calls MemActorCritic(...) with controller_type=args.controller.
+	•	It still calls agent.initial_state(B, device).
+	•	It still passes controller="gru" or "mamba" from the CLI flag.
+
+Your existing --controller flag in the argparser stays the same:
+
+parser.add_argument(
+    "--controller",
+    type=str,
+    default="gru",
+    choices=["gru", "bamba", "mamba"],
+)
+
+For now, you can ignore "bamba" in the new class or wire it later.
+
+⸻
+
+5. Run a “perfect memory” test with Mamba + pseudomodes
+
+Example: delayed cue, horizon 200, Mamba controller:
+
+python neural_memory_long_ppo.py \
+    --task delayed_cue \
+    --controller mamba \
+    --horizon 200 \
+    --num-envs 64 \
+    --rollout-length 256 \
+    --total-updates 2000 \
+    --hidden-size 128 \
+    --memory-slots 16 \
+    --memory-dim 64 \
+    --gate-coef 1.0 \
+    --track \
+    --run-name mamba_pseudomode_delayedcue
+
+You’re looking for:
+	•	Return → ~1.0
+	•	GateMean → around 1 / horizon (≈ 0.005 for horizon 200) or a small multiple.
+
+Then you can:
+	•	Crank horizon up (500, 1000, 2000).
+	•	Switch to --task copy_memory, assoc_recall, tmaze.
+	•	Compare --controller gru vs --controller mamba with the same pseudo-mode memory.
+
+⸻
+
+6. Minimal summary
+	1.	pip install -e . in the Mamba repo once.
+	2.	Add mem_actor_critic_mamba.py (above) to your neural-memory project.
+	3.	Change one import in neural_memory_long_ppo.py to use this MemActorCritic.
+	4.	Run with --controller mamba and your tasks/horizons.
+
+This is the cleanest, production-grade way to splice Mamba2 + your pseudomodes into the existing PPO benchmark without ripping the rest of your code apart.
+
+Almost, Mr Block — you’re 95% there.
+You only need a few small details on top of what you pasted.
+
+⸻
+
+1. Yes: that pipeline is structurally complete
+
+This is enough in terms of steps:
+	1.	pip install -e . inside the Mamba repo (once).
+	2.	Add mem_actor_critic_mamba.py to your neural-memory project.
+	3.	Change the import in neural_memory_long_ppo.py to:
+
+from neural_memory_final import make_env
+from mem_actor_critic_mamba import MemActorCritic
+
+
+	4.	Run with --controller mamba on your tasks.
+
+That’s the correct integration logic.
+
+⸻
+
+2. Hidden requirements you still need to respect
+
+There are a few practical gotchas that aren’t obvious from the snippet:
+
+2.1 Torch + CUDA + build toolchain
+
+You must have:
+	•	A working PyTorch with CUDA (torch.cuda.is_available() true).
+	•	A proper compiler toolchain:
+	•	On Linux: nvcc + GCC installed → pip install -e . in Mamba will compile selective_scan_cuda.
+	•	If this fails, Mamba will fallback to slow paths or just break.
+
+If pytest tests/ops/test_selective_scan.py -q passes in the Mamba repo, you’re good.
+
+⸻
+
+2.2 Requirements entry
+
+In your memory project’s requirements.txt, add a line for the installed Mamba package, e.g.:
+
+mamba-ssm @ git+https://github.com/state-spaces/mamba.git
+
+(or whatever path you actually cloned from).
+
+This ensures any future env rebuild knows to pull Mamba.
+
+⸻
+
+2.3 Dimension alignment between controller and pseudomodes
+
+In the provided mem_actor_critic_mamba.py:
+	•	hidden_size = size of controller state h
+	•	memory_dim = size of pseudomode slot vectors
+
+Inside PseudoModeMemory I wrote:
+
+self.key_proj = nn.Linear(slot_dim, slot_dim)
+self.write_proj = nn.Linear(slot_dim, slot_dim)
+
+but h has size hidden_size, not slot_dim unless you choose them equal.
+
+So you must do one of these:
+
+Option A (simplest): make them equal
+Run with:
+
+--hidden-size 128 \
+--memory-dim 128
+
+and change PseudoModeMemory to:
+
+self.key_proj = nn.Linear(hidden_size, slot_dim)
+self.write_proj = nn.Linear(hidden_size, slot_dim)
+
+or more explicitly pass both dims into the constructor and wire it correctly.
+
+Option B: add explicit projection
+If you want hidden_size != memory_dim, then:
+	•	Change the constructor of PseudoModeMemory to accept in_dim (controller dim) and slot_dim.
+	•	Use nn.Linear(in_dim, slot_dim) for write_proj and key_proj.
+
+Right now, the snippet assumes “Dh == slot_dim” but doesn’t enforce it in code. If you don’t fix that, you’ll get shape mismatch errors.
+
+⸻
+
+2.4 Bamba controller branch (optional)
+
+In MemActorCritic, the choices=["gru", "bamba", "mamba"] still exist in the CLI, but the class only implements "gru" and "mamba".
+
+Either:
+	•	Remove "bamba" from choices, or
+	•	Add a bamba branch later.
+
+This won’t stop you from running GRU or Mamba, but if you pass --controller bamba it will crash.
+
+⸻
+
+3. Quick sanity checklist
+
+If all of these are true, you’re done:
+	•	pip install -e . in Mamba repo works.
+	•	pytest tests/ops/test_selective_scan.py -q passes.
+	•	from mamba_ssm.modules.mamba2 import Mamba2 works in a Python shell.
+	•	mem_actor_critic_mamba.py is in your project and importing cleanly.
+	•	neural_memory_long_ppo.py imports MemActorCritic from mem_actor_critic_mamba.
+	•	hidden_size and memory_dim are wired so PseudoModeMemory projections have matching in/out dims.
+
+If yes, then yes — that’s all you need to start training Mamba + pseudomode “perfect memory” agents.
