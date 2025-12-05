@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  mmaba:
+    build: .
+    image: mmaba-pseudo:latest
+    volumes:
+      - ./wandb:/app/wandb
+    environment:
+      - WANDB_API_KEY=${WANDB_API_KEY}
+    command: python3 neural_memory_long_ppo.py --task delayed_cue --controller mamba --num-envs 64 --rollout-length 256 --total-updates 2000 --track

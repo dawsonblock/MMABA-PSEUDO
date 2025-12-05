@@ -1,0 +1,9 @@
+wandb/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+*.code-workspace
+text.txt
