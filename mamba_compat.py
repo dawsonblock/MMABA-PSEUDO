@@ -19,6 +19,23 @@ def patch_mamba_for_cpu():
         torch.mps.current_device = lambda: 0
         print("[+] Patched torch.mps.current_device")
 
+    # Patch torch.cuda.device to be a no-op context manager
+    if not hasattr(torch.cuda, "device"):
+        # If compiled without CUDA, torch.cuda might be minimal
+        pass
+    
+    # We always overwrite/patch it because the Mamba code calls it explicitly
+    class DeviceContext:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            pass
+        def __exit__(self, *args):
+            pass
+            
+    torch.cuda.device = DeviceContext
+    print("[+] Patched torch.cuda.device")
+
     # Mock triton if not available
     import sys
     import types
@@ -28,9 +45,21 @@ def patch_mamba_for_cpu():
         triton = types.ModuleType("triton")
         triton.__version__ = "2.1.0"
         triton.__spec__ = MagicMock()
-        triton.jit = lambda x: x
-        triton.autotune = lambda *args, **kwargs: lambda x: x
-        triton.heuristics = lambda *args, **kwargs: lambda x: x
+        class MockKernel:
+            def __init__(self, func):
+                self.func = func
+                self.best_config = MagicMock()
+                self.best_config.kwargs = {"BLOCK_SIZE_M": 32} # Default mock
+
+            def __getitem__(self, grid):
+                return self.func
+
+            def __call__(self, *args, **kwargs):
+                return self.func(*args, **kwargs)
+
+        triton.jit = lambda x: MockKernel(x)
+        triton.autotune = lambda *args, **kwargs: lambda x: MockKernel(x)
+        triton.heuristics = lambda *args, **kwargs: lambda x: MockKernel(x)
         triton.next_power_of_2 = lambda x: 1 << (x - 1).bit_length()
         triton.cdiv = lambda x, y: (x + y - 1) // y
         
@@ -63,6 +92,72 @@ def patch_mamba_for_cpu():
         sys.modules["triton.compiler.compiler"] = triton.compiler.compiler
         
         print("[+] Mocked triton for Mamba import")
+    
+    # Mock causal_conv1d if not available
+    if "causal_conv1d" not in sys.modules:
+        causal_conv1d = types.ModuleType("causal_conv1d")
+        
+        def causal_conv1d_fn_compat(x, weight, bias=None, activation=None):
+            # x: (B, D, L)
+            # weight: (D, K)
+            # bias: (D)
+            # Returns: (B, D, L)
+            # This is essentially a depthwise conv1d with padding
+            # But the CUDA kernel is slightly specific about activation
+            
+            # Simple reference: 
+            # D = x.shape[1]
+            # K = weight.shape[1]
+            # padding = K - 1
+            # out = F.conv1d(x, weight.unsqueeze(1), bias, padding=padding, groups=x.shape[1])
+            # return out[:, :, :x.shape[2]]  # Causal crop
+            
+            # However, the signature in ssd_combined.py seems to imply weight is (D, W) or similar
+            # Let's check usage in Mamba.
+            # Usually weight is (D, kernel_size).
+            # And it's depthwise.
+            
+            check_weight_shape = weight.shape
+            D = x.shape[1]
+            
+            # If weight is (D, 1, K), great. If (D, K), reshape.
+            if weight.dim() == 2:
+                weight = weight.unsqueeze(1)
+            
+            padding = weight.shape[2] - 1
+            out = F.conv1d(x, weight, bias, padding=padding, groups=D)
+            out = out[..., :x.shape[-1]]
+            
+            if activation == "silu":
+                out = F.silu(out)
+            elif activation == "swish":
+                out = F.silu(out)
+            elif activation == "gelu":
+                out = F.gelu(out)
+            elif activation == "relu":
+                out = F.relu(out)
+                
+            return out
+
+        def causal_conv1d_fwd_function_compat(x, weight, bias=None, seq_idx=None, initial_states=None, final_states=None, activation=False):
+            # activation is boolean in fwd_function? In ssd_combined it passes `activation in ["silu", "swish"]` which is bool
+            # if True -> silu/swish
+            act_str = "silu" if activation else None
+            return causal_conv1d_fn_compat(x, weight, bias, activation=act_str)
+            
+        causal_conv1d.causal_conv1d_fn = causal_conv1d_fn_compat
+        causal_conv1d.causal_conv1d_fwd_function = causal_conv1d_fwd_function_compat
+        
+        # Also need cpp_functions submodule
+        cpp_functions = types.ModuleType("causal_conv1d.cpp_functions")
+        cpp_functions.causal_conv1d_fwd_function = causal_conv1d_fwd_function_compat
+        # We might need bwd too eventually, but let's start with fwd
+        cpp_functions.causal_conv1d_bwd_function = MagicMock()
+        cpp_functions.causal_conv1d_update_function = MagicMock()
+        
+        sys.modules["causal_conv1d"] = causal_conv1d
+        sys.modules["causal_conv1d.cpp_functions"] = cpp_functions
+        print("[+] Mocked causal_conv1d for Mamba import")
 
     # Mock selective_scan_cuda if not available
     if "selective_scan_cuda" not in sys.modules:
@@ -82,11 +177,72 @@ def patch_mamba_for_cpu():
         import mamba_ssm.ops.selective_scan_interface as ssi
         
         # Patch selective_scan_fn
+    
         def selective_scan_fn_compat(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False, return_last_state=False):
             return selective_scan_ref(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
         
         ssi.selective_scan_fn = selective_scan_fn_compat
         print("[+] Patched selective_scan_fn")
+
+        # Patch _chunk_cumsum_fwd within ssd_chunk_state EARLY to avoid import caching
+        try:
+            import mamba_ssm.ops.triton.ssd_chunk_state as ssd_chunk_state
+            
+            def _chunk_cumsum_fwd_compat(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+                # dt: (batch, seqlen, nheads)
+                batch, seqlen, nheads = dt.shape
+                if seqlen % chunk_size != 0:
+                    dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+                dt = dt.reshape(batch, -1, chunk_size, nheads).permute(0, 3, 1, 2)
+                # dt comes in as (batch, seqlen, nheads)
+                # target is (batch, nheads, nchunks, chunk_size)
+                
+                nchunks = math.ceil(seqlen / chunk_size)
+                dt = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
+                
+                # Apply bias/softplus/limit
+                if dt_bias is not None:
+                    dt = dt + rearrange(dt_bias, "h -> h 1 1")
+                if dt_softplus:
+                    dt = F.softplus(dt)
+                
+                # Clamp
+                if dt_limit != (0.0, float("inf")):
+                    dt = dt.clamp(min=dt_limit[0], max=dt_limit[1])
+                
+                dt_out = dt.to(dtype=torch.float32)
+                
+                # Compute dA
+                dA = dt_out * rearrange(A, "h -> h 1 1")
+                
+                # Cumsum
+                dA_cumsum = torch.cumsum(dA, dim=-1)
+                
+                return dA_cumsum, dt_out
+
+                return dA_cumsum, dt_out
+
+            original_func = ssd_chunk_state._chunk_cumsum_fwd
+            ssd_chunk_state._chunk_cumsum_fwd = _chunk_cumsum_fwd_compat
+            print("[+] Patched mamba_ssm.ops.triton.ssd_chunk_state._chunk_cumsum_fwd")
+            
+            # Aggressive walk to replace reference in already loaded modules
+            count = 0
+            for mod_name, mod in list(sys.modules.items()):
+                if not mod_name.startswith("mamba_ssm"):
+                    continue
+                try:
+                    for attr_name, attr_val in list(mod.__dict__.items()):
+                        if attr_val is original_func:
+                            setattr(mod, attr_name, _chunk_cumsum_fwd_compat)
+                            # print(f"[+] Replaced reference in {mod_name}.{attr_name}")
+                            count += 1
+                except AttributeError:
+                    pass
+            print(f"[+] Replaced {count} references to _chunk_cumsum_fwd across loaded modules")
+            
+        except ImportError:
+            print("[-] Could not patch _chunk_cumsum_fwd (import failed)")
 
         # Patch mamba_chunk_scan_combined
         from mamba_ssm.ops.triton.ssd_combined import ssd_chunk_scan_combined_ref
@@ -218,7 +374,10 @@ def patch_mamba_for_cpu():
         Mamba2.__init__ = mamba2_init_compat
         print("[+] Patched Mamba2.__init__")
 
+
+
     except ImportError as e:
+
         import traceback
         traceback.print_exc()
         print(f"[-] Mamba Compat Error: Could not import Mamba modules to patch. {e}")

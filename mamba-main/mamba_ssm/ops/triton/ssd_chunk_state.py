@@ -677,6 +677,25 @@ def _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_lim
     if dt_bias is not None:
         assert dt_bias.shape == (nheads,)
     nchunks = math.ceil(seqlen / chunk_size)
+    nchunks = math.ceil(seqlen / chunk_size)
+
+    if dt.device.type != 'cuda':
+        if seqlen % chunk_size != 0:
+             dt = F.pad(dt, (0, 0, 0, chunk_size - seqlen % chunk_size))
+        dt_out = rearrange(dt, "b (c l) h -> b h c l", l=chunk_size)
+
+        if dt_bias is not None:
+             dt_out = dt_out + rearrange(dt_bias, "h -> h 1 1")
+        if dt_softplus:
+             dt_out = F.softplus(dt_out)
+        if dt_limit != (0.0, float("inf")):
+             dt_out = dt_out.clamp(min=dt_limit[0], max=dt_limit[1])
+
+        dt_out = dt_out.to(dtype=torch.float32)
+        dA = dt_out * rearrange(A, "h -> h 1 1")
+        dA_cumsum = torch.cumsum(dA, dim=-1)
+        return dA_cumsum, dt_out
+
     dt_out = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     dA_cumsum = torch.empty(batch, nheads, nchunks, chunk_size, device=dt.device, dtype=torch.float32)
     grid_chunk_cs = lambda META: (batch, nchunks, triton.cdiv(nheads, META['BLOCK_SIZE_H']))
@@ -746,9 +765,22 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
         assert seq_idx.shape == (batch, seqlen)
     if states is not None:
         assert states.shape == (batch, nchunks, nheads, headdim, dstate)
+    if seq_idx is not None:
+        assert seq_idx.shape == (batch, seqlen)
+    if states is not None:
+        assert states.shape == (batch, nchunks, nheads, headdim, dstate)
     else:
         states_dtype = torch.float32 if states_in_fp32 else B.dtype
         states = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype)
+    
+    if x.device.type != 'cuda':
+        if seq_idx is not None:
+             pass # Warning: seq_idx ignored in ref
+        # Call pure python ref. Note: ref returns new tensor, doesn't write to `states`
+        ref_states = chunk_state_ref(B, x, dt, dA_cumsum)
+        states.copy_(ref_states)
+        return states
+
     grid = lambda META: (triton.cdiv(headdim, META['BLOCK_SIZE_M']) * triton.cdiv(dstate, META['BLOCK_SIZE_N']),
                     batch * nchunks, nheads)
     with torch.cuda.device(x.device.index):

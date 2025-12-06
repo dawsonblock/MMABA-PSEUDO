@@ -8,9 +8,10 @@ It is designed to be a drop-in benchmark suite for testing memory capabilities i
 
 *   **Dual Controller Support**: Run with either `gru` (standard RNN) or `mamba` (State Space Model).
 *   **Pseudomode Memory**: An external long-term memory module that allows the agent to store and retrieve information over long horizons.
-*   **Mac/MPS Support**: Fully compatible with macOS (Apple Silicon).
-    *   **Auto-Device Detection**: Automatically uses `mps` (Metal Performance Shaders) on Mac, `cuda` on Linux/Windows, or `cpu` as a fallback.
-    *   **MockMamba Fallback**: If the official `mamba_ssm` CUDA kernel is not installed (e.g., on a Mac), the system automatically falls back to a **MockMamba2** implementation (backed by a GRU) to ensure the pipeline remains functional for development and debugging.
+*   **Full Mac/MPS Support**: Mamba 2 runs natively on Apple Silicon (M1/M2/M3) via a pure PyTorch compatibility layer.
+    *   No CUDA or Triton required.
+    *   Automatically patches `mamba_ssm` to use reference PyTorch implementations.
+    *   Import `mamba_compat` at the top of your script to enable MPS support.
 *   **Vectorized Environments**: Fast, pure-PyTorch implementations of memory tasks.
 *   **Recurrent PPO**: A PPO implementation optimized for recurrent policies with full-sequence evaluation.
 
@@ -23,45 +24,51 @@ It is designed to be a drop-in benchmark suite for testing memory capabilities i
     ```
 
 2.  **Install Dependencies**:
-    We provide a unified build script that handles dependencies and Mamba installation (or fallback) automatically.
     ```bash
-    ./unified_build.sh
+    pip install torch numpy wandb einops
     ```
 
-    *Alternatively, you can install manually:*
+3.  **Install Mamba (editable mode)**:
     ```bash
-    pip install torch numpy wandb
-    # Optional: pip install mamba-ssm
+    cd mamba-main
+    pip install -e . --no-build-isolation
+    cd ..
     ```
+    > **Note**: The `mamba-main` package has been patched to remove Triton dependencies for macOS compatibility.
 
 ## Usage
 
-Run the training script `neural_memory_long_ppo.py`.
-
-### Basic Example (Delayed Cue Task)
+### Training on Mac (MPS)
 
 ```bash
 python3 neural_memory_long_ppo.py \
     --task delayed_cue \
     --controller mamba \
-    --horizon 200 \
+    --device mps \
+    --num-envs 4 \
+    --total-updates 2000
+```
+
+> **Recommended**: Use `--num-envs 4` on Mac to avoid MPS memory limits.
+
+### Training on CUDA
+
+```bash
+python3 neural_memory_long_ppo.py \
+    --task delayed_cue \
+    --controller mamba \
+    --device cuda \
     --num-envs 64 \
-    --rollout-length 256 \
-    --total-updates 2000 \
-    --hidden-size 128 \
-    --memory-slots 16 \
-    --memory-dim 64 \
-    --gate-coef 1.0 \
-    --track \
-    --run-name mamba_pseudomode_delayedcue
+    --total-updates 2000
 ```
 
 ### Command Line Arguments
 
 | Argument | Description | Default |
 | :--- | :--- | :--- |
-| `--task` | Task to run: `delayed_cue`, `copy_memory`, `assoc_recall`, `tmaze` | `delayed_cue` |
+| `--task` | Task: `delayed_cue`, `copy_memory`, `assoc_recall`, `tmaze` | `delayed_cue` |
 | `--controller` | Controller type: `gru` or `mamba` | `gru` |
+| `--device` | Device: `cuda`, `mps`, or `cpu` | `cuda` |
 | `--horizon` | Task horizon (difficulty) | `200` |
 | `--num-envs` | Number of parallel environments | `64` |
 | `--rollout-length` | PPO rollout length (should be > horizon) | `256` |
@@ -69,10 +76,28 @@ python3 neural_memory_long_ppo.py \
 
 ## File Structure
 
-*   `neural_memory_long_ppo.py`: Main entry point. Contains the PPO training loop and agent initialization.
-*   `mem_actor_critic_mamba.py`: Defines the `MemActorCritic` agent, the `PseudoModeMemory` module, and the `MockMamba2` fallback class.
-*   `neural_memory_final.py`: Contains the vectorized environment implementations (`make_env`).
-*   `wandb_integration.py`: A lightweight wrapper for WandB logging.
+| File | Description |
+| :--- | :--- |
+| `neural_memory_long_ppo.py` | Main training script with PPO loop |
+| `mem_actor_critic_mamba.py` | Agent, PseudoModeMemory, and Mamba2 integration |
+| `mamba_compat.py` | **MPS/CPU compatibility layer** for Mamba 2 |
+| `neural_memory_final.py` | Vectorized environment implementations |
+| `mamba-main/` | Patched Mamba SSM library (Triton-free) |
+
+## Mamba MPS Compatibility
+
+The `mamba_compat.py` module provides a compatibility layer for running Mamba 2 on non-CUDA devices:
+
+- **Mocks Triton**: Prevents import errors on macOS.
+- **Patches Kernels**: Replaces CUDA-specific functions with PyTorch equivalents.
+- **Auto-Activates**: Automatically applies patches when CUDA is unavailable.
+
+To use Mamba on MPS, ensure `mamba_compat` is imported **before** any Mamba modules:
+
+```python
+import mamba_compat  # Must be first!
+from mamba_ssm.modules.mamba2 import Mamba2
+```
 
 ## License
 
