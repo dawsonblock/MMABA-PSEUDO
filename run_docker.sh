@@ -1,3 +1,10 @@
 #!/bin/bash
-docker build -t mmaba-pseudo .
-docker run --rm -v $(pwd)/wandb:/app/wandb mmaba-pseudo "$@"
+
+# Define the image name
+IMAGE_NAME="mmaba-pseudo"
+
+# Build the image
+docker build -t "$IMAGE_NAME" .
+
+# Run the container
+docker run -it --rm -v "$(pwd)/wandb:/app/wandb" "$IMAGE_NAME" "$@"
