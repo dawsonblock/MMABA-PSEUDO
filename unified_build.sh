@@ -20,7 +20,7 @@ echo "[*] Mamba directory: $MAMBA_DIR"
 # 1. Install root dependencies
 echo ""
 echo "[1/3] Installing root dependencies..."
-pip3 install torch numpy wandb
+pip3 install -r "$SCRIPT_DIR/requirements.txt"
 echo "[+] Root dependencies installed."
 
 # 2. Check for Mamba directory

@@ -1,8 +1,8 @@
-version: '3.8'
 services:
   mmaba:
     build: .
     image: mmaba-pseudo:latest
+    user: "1000:1000"
     volumes:
       - ./wandb:/app/wandb
     environment:
