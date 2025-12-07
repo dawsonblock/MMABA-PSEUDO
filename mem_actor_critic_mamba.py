@@ -171,6 +171,10 @@ class PseudoModeMemory(nn.Module):
         # Usage update
         # usage[b, k] += g if k==idx
         new_usage = usage + gate.unsqueeze(-1) * mask
+        
+        # ASSERTION: Verify memory integrity
+        assert torch.isfinite(new_modes).all(), "NaN/Inf detected in memory modes"
+        assert torch.isfinite(new_usage).all(), "NaN/Inf detected in memory usage"
 
         return PseudoModeState(modes=new_modes, usage=new_usage)
 
@@ -296,7 +300,12 @@ class MemActorCritic(nn.Module):
             h = self.controller(ctrl_in, state["h"])     # (B, H)
 
         elif self.controller_type == "mamba":
-            # Mamba2 expects (B, T, D). We treat each step as T=1.
+            # NOTE: Mamba2 expects (B, T, D). We treat each step as T=1.
+            # LIMITATION: This means Mamba's internal convolution state is NOT
+            # preserved across timesteps. The recurrence is handled by the
+            # external PseudoModeMemory, not Mamba's internal SSM state.
+            # For true Mamba state caching, Mamba2 would need to be modified
+            # to accept and return internal state tensors.
             ctrl_in_seq = ctrl_in.unsqueeze(1)           # (B, 1, H+M)
             h_seq = self.controller(ctrl_in_seq)         # (B, 1, H+M)
             h_full = h_seq.squeeze(1)                    # (B, H+M)
@@ -321,6 +330,11 @@ class MemActorCritic(nn.Module):
         next_state = {"h": h, "mem": mem_state}
         extras = {
             "read_vec": read_vec,
+            "gate_mean": gate.mean().item(),  # For logging
         }
+        
+        # ASSERTION: Verify output integrity
+        assert torch.isfinite(logits).all(), "NaN/Inf detected in policy logits"
+        assert torch.isfinite(value).all(), "NaN/Inf detected in value estimate"
 
         return logits, value, next_state, gate, extras

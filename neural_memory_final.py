@@ -181,15 +181,10 @@ class DelayedCueEnv(BaseVecEnv):
 
         # Advance time / reset finished envs
         self.t += 1
-        # envs that just finished: resample cues and restart t[b]=0
-        finished = done
-        if finished.any():
-            self._sample_cues(finished)
-
-        # Any env that didn't just finish but reached horizon anyway: wrap (safety)
-        overshoot = self.t >= self.horizon
-        if overshoot.any():
-            self._sample_cues(overshoot)
+        
+        # Reset envs that just finished (done=True means query step was completed)
+        if done.any():
+            self._sample_cues(done)
 
         # Build next observation
         obs = self._build_obs()
@@ -335,11 +330,6 @@ class CopyMemoryEnv(BaseVecEnv):
         # Reset finished envs
         if finished.any():
             self._sample_sequences(finished)
-
-        # Safety wrap (shouldn't be needed)
-        overshoot = self.t >= self.total_len
-        if overshoot.any():
-            self._sample_sequences(overshoot)
 
         obs = self._build_obs()
         return obs, reward, done
@@ -487,10 +477,6 @@ class AssocRecallEnv(BaseVecEnv):
         if finished.any():
             self._sample_pairs(finished)
 
-        overshoot = self.t >= self.total_len
-        if overshoot.any():
-            self._sample_pairs(overshoot)
-
         obs = self._build_obs()
         return obs, reward, done
 
@@ -610,10 +596,6 @@ class TMazeEnv(BaseVecEnv):
         if finished.any():
             done[finished] = True
             self._sample_cues(finished)
-
-        overshoot = self.t >= self.total_len
-        if overshoot.any():
-            self._sample_cues(overshoot)
 
         obs = self._build_obs()
         return obs, reward, done

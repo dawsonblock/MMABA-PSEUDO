@@ -70,6 +70,12 @@ class PPOTrainer:
                 self.device = torch.device("cpu")
         else:
             self.device = torch.device(args.device)
+        
+        # PERFORMANCE: Enable CUDA optimizations
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision('high')
+            print("[PERF] CUDNN benchmark enabled, matmul precision set to 'high'")
 
         set_seed(args.seed)
 
@@ -99,16 +105,22 @@ class PPOTrainer:
             memory_slots=args.memory_slots,
             memory_dim=args.memory_dim,
         ).to(self.device)
-
-        self.optimizer = torch.optim.Adam(
+        
+        # PERFORMANCE: Use fused optimizer on CUDA for better performance
+        use_fused = self.device.type == "cuda" and hasattr(torch.optim.AdamW, '_fused')
+        self.optimizer = torch.optim.AdamW(
             self.agent.parameters(),
             lr=args.learning_rate,
             eps=1e-5,
+            fused=use_fused if use_fused else False,
         )
+        if use_fused:
+            print("[PERF] Using fused AdamW optimizer")
 
         # Logging
         self.global_step = 0
         self.run = wlog.init_wandb(args)
+
 
     # ------------------------------------------------------------------ #
 
@@ -300,8 +312,9 @@ class PPOTrainer:
         # PseudoModeState structure is defined in mem_actor_critic_mamba.PseudoModeState
         from mem_actor_critic_mamba import PseudoModeState
 
-        mem0 = PseudoModeState(modes=modes0, usage=usage0)
-        return {"h": h0, "mem": mem0}
+        # CRITICAL: Detach tensors to prevent gradient leakage across episodes
+        mem0 = PseudoModeState(modes=modes0.detach().clone(), usage=usage0.detach().clone())
+        return {"h": h0.detach().clone(), "mem": mem0}
 
     # ------------------------------------------------------------------ #
 
@@ -334,6 +347,10 @@ class PPOTrainer:
             )
 
             logits, value, state, gate, extras = self.agent(obs[t], state)
+            
+            # ASSERTION: Check for NaN/Inf in logits
+            assert torch.isfinite(logits).all(), f"NaN/Inf detected in logits at step {t}"
+            
             dist = Categorical(logits=logits)
 
             logp = dist.log_prob(actions[t])
@@ -414,6 +431,14 @@ class PPOTrainer:
             # PPO ratio
             log_ratio = logp_new - old_logp_flat
             ratio = log_ratio.exp()
+            
+            # ASSERTION: Check for NaN/Inf in ratio
+            assert torch.isfinite(ratio).all(), "NaN/Inf detected in PPO ratio"
+            
+            # ASSERTION: Warn if ratio is extreme (indicates policy divergence)
+            if (ratio > 10.0).any() or (ratio < 0.1).any():
+                import warnings
+                warnings.warn(f"Extreme PPO ratio detected: min={ratio.min().item():.4f}, max={ratio.max().item():.4f}")
 
             # Surrogate losses
             surr1 = ratio * adv_flat
