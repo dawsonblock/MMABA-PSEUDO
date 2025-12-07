@@ -148,10 +148,41 @@ y_t, state = m_step(x_t, state)
 
 ---
 
-## Files to Implement
+## Files Implemented
 
-1. **`mamba_ssm/recurrent.py`** — `RecurrentMambaCell` class
-2. **`mamba_ssm/ops/step_kernel.py`** — CUDA/Triton step kernel (optional but recommended)
+| File | Purpose |
+|:--|:--|
+| `mamba_ssm/ops/csrc/recurrent_mamba_step.cpp` | C++ dispatch (CPU/CUDA) |
+| `mamba_ssm/ops/csrc/recurrent_mamba_step_cuda.cu` | CUDA kernel stubs |
+| `mamba_ssm/ops/recurrent_step_torch.py` | Python autograd.Function wrapper |
+| `mamba_ssm/recurrent_streaming.py` | True O(T) RecurrentMambaCell + MambaState |
+| `tests/test_recurrent_kernel_equiv.py` | Equivalence tests |
+| `setup_recurrent.py` | Build script |
+
+## Build Instructions
+
+```bash
+cd mamba-main
+
+# CPU only (PyTorch fallback)
+python setup_recurrent.py build_ext --inplace
+
+# With CUDA kernel
+python setup_recurrent.py build_ext --inplace --cuda
+```
+
+## Running Tests
+
+```bash
+# Reference tests (history-based)
+cd src && python test_recurrent_mamba_cell.py
+
+# Kernel equivalence tests
+cd mamba-main/tests && python test_recurrent_kernel_equiv.py
+
+# Full test suite with pytest
+pytest mamba-main/tests/ -v
+```
 
 ---
 
