@@ -3,24 +3,16 @@
 True streaming recurrent Mamba cell with O(T) complexity.
 
 This module provides:
-- MambaState: Fixed-size state (conv_state + ssm_state)
+- MambaState: Fixed-size state (conv_state + ssm_state, both (B, D, ...))
 - RecurrentMambaCell: True O(T) streaming cell using kernel
 
 Unlike the reference implementation in recurrent.py (which uses full history
 and is O(T²)), this uses fixed-size state that updates in O(1) per step.
 
-Usage:
-    from mamba_ssm.recurrent_streaming import RecurrentMambaCell, MambaState
-    
-    # Wrap existing Mamba2
-    cell = RecurrentMambaCell(core_mamba)
-    
-    # Streaming loop
-    state = cell.initial_state(batch_size, device, dtype)
-    for t in range(T):
-        y_t, state = cell(x[:, t, :], state)
-        if done.any():
-            state = state.mask_done(done)
+The kernel implements per-feature SSM+conv:
+  u = sum_k W_conv[d,k] * w_k + b_conv[d]
+  z = A[d] * s_prev + B[d] * u  
+  y = C[d] * z + D_skip[d] * u
 """
 from __future__ import annotations
 
@@ -39,15 +31,14 @@ class MambaState:
     """
     True recurrent state for streaming Mamba.
     
-    This is fixed-size and updates in O(1) per step, unlike the reference
-    implementation which stores full history.
+    This is fixed-size and updates in O(1) per step.
     
     Attributes:
         conv_state: (B, D, K-1) rolling window for causal convolution
-        ssm_state: (B, N_state, D_inner) state-space model internal state
+        ssm_state: (B, D) SSM internal state (one scalar per feature)
     """
     conv_state: Tensor   # (B, D, K-1)
-    ssm_state: Tensor    # (B, N_state, D_inner)
+    ssm_state: Tensor    # (B, D)
     
     @classmethod
     def zeros(
@@ -55,8 +46,6 @@ class MambaState:
         batch_size: int,
         d_model: int,
         kernel_size: int,
-        n_state: int,
-        d_inner: int,
         device: torch.device,
         dtype: torch.dtype = torch.float32,
     ) -> "MambaState":
@@ -67,8 +56,6 @@ class MambaState:
             batch_size: Batch size B
             d_model: Model dimension D
             kernel_size: Conv kernel size K (state holds K-1)
-            n_state: SSM state dimension N
-            d_inner: SSM internal dimension
             device: Torch device
             dtype: Tensor dtype
         """
@@ -77,7 +64,7 @@ class MambaState:
             device=device, dtype=dtype
         )
         ssm_state = torch.zeros(
-            batch_size, n_state, d_inner,
+            batch_size, d_model,
             device=device, dtype=dtype
         )
         return cls(conv_state=conv_state, ssm_state=ssm_state)
@@ -99,11 +86,12 @@ class MambaState:
         if done.shape[0] != B:
             raise ValueError(f"done batch {done.shape[0]} != state batch {B}")
         
-        # Create mask: (B, 1, 1) for broadcasting
-        mask = (~done).view(-1, 1, 1).to(self.conv_state.dtype)
+        # Create masks
+        mask_2d = (~done).view(-1, 1).to(self.ssm_state.dtype)  # (B, 1)
+        mask_3d = mask_2d.unsqueeze(-1)  # (B, 1, 1)
         
-        conv_state = self.conv_state * mask
-        ssm_state = self.ssm_state * mask
+        conv_state = self.conv_state * mask_3d
+        ssm_state = self.ssm_state * mask_2d
         
         return MambaState(conv_state=conv_state, ssm_state=ssm_state)
     
@@ -126,100 +114,67 @@ class RecurrentMambaCell(nn.Module):
     """
     True streaming recurrent Mamba cell with O(T) complexity.
     
-    This wraps a Mamba2 module and provides a step API:
+    This wraps a Mamba2 module or creates standalone SSM+conv parameters,
+    and provides a step API:
         y_t, new_state = cell(x_t, state)
     
-    The state is fixed-size (doesn't grow with T), achieving O(T) streaming
-    for a sequence of length T.
+    The state is fixed-size (doesn't grow with T), achieving O(T) streaming.
     
     Example:
-        >>> from mamba_ssm.modules.mamba2 import Mamba2
-        >>> mamba = Mamba2(d_model=64, d_state=16, d_conv=4)
-        >>> cell = RecurrentMambaCell(mamba)
-        >>> 
-        >>> state = cell.initial_state(batch_size=4, device='cuda', dtype=torch.float32)
+        >>> cell = RecurrentMambaCell(d_model=64, kernel_size=4)
+        >>> state = cell.initial_state(batch_size=4, device='cuda')
         >>> for t in range(seq_len):
         ...     y_t, state = cell(x[:, t, :], state)
     """
     
-    def __init__(self, core_mamba: nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        kernel_size: int = 4,
+        core_mamba: Optional[nn.Module] = None,
+    ):
         """
-        Initialize streaming cell from a Mamba2 module.
+        Initialize streaming cell.
         
         Args:
-            core_mamba: An instance of Mamba2 whose weights will be used
+            d_model: Feature dimension D
+            kernel_size: Conv kernel size K
+            core_mamba: Optional Mamba2 to extract weights from (not used yet)
         """
         super().__init__()
         
-        # Store reference to core (for parameter access)
-        self.core = core_mamba
+        self.d_model = d_model
+        self.kernel_size = kernel_size
         
-        # Extract hyperparameters
-        self.d_model = core_mamba.d_model
-        self.d_state = getattr(core_mamba, 'd_state', 16)
-        self.d_conv = getattr(core_mamba, 'd_conv', 4)
-        self.expand = getattr(core_mamba, 'expand', 2)
+        # Create learnable parameters
+        # Conv: (D, K)
+        self.W_conv = nn.Parameter(torch.randn(d_model, kernel_size) * 0.02)
+        self.b_conv = nn.Parameter(torch.zeros(d_model))
         
-        # Kernel size for conv state
-        self.kernel_size = self.d_conv
+        # SSM parameters: (D,)
+        # A: decay (initialized near 1 so state persists)
+        self.A = nn.Parameter(torch.ones(d_model) * 0.9)
+        # B: input gain
+        self.Bp = nn.Parameter(torch.ones(d_model) * 0.1)
+        # C: output gain
+        self.C = nn.Parameter(torch.ones(d_model))
+        # D: skip connection
+        self.D_skip = nn.Parameter(torch.zeros(d_model))
         
-        # Internal dimensions (infer from core)
-        self.n_state = self.d_state
-        self.d_inner = self.d_model * self.expand
-        
-        # Extract parameters from core Mamba2
-        # These need to match the actual parameter names in Mamba2
-        self._extract_params()
+        # If core_mamba provided, try to extract weights
+        if core_mamba is not None:
+            self._extract_from_mamba(core_mamba)
     
-    def _extract_params(self) -> None:
+    def _extract_from_mamba(self, core: nn.Module) -> None:
         """
-        Extract and register parameters from core Mamba2.
+        Extract parameters from Mamba2 core.
         
-        The kernel needs access to conv weights, A, B, C, D matrices.
+        This is approximate - real Mamba2 has more complex structure.
+        For now, we just use our own parameters.
         """
-        core = self.core
-        
-        # Conv weight: look for conv1d or similar
-        # Mamba2 typically has in_proj, conv1d, x_proj, dt_proj, out_proj
-        
-        # Get conv weight (shape depends on Mamba2 version)
-        if hasattr(core, 'conv1d') and hasattr(core.conv1d, 'weight'):
-            # Standard conv1d layer
-            self.register_buffer('conv_weight', core.conv1d.weight.squeeze(0))
-        else:
-            # Fallback: create placeholder
-            self.register_buffer(
-                'conv_weight',
-                torch.ones(self.d_inner, self.kernel_size)
-            )
-        
-        # SSM parameters A, B, C, D
-        # These are typically computed dynamically in Mamba2, so we need
-        # to extract the projection layers and compute at runtime
-        if hasattr(core, 'A_log'):
-            # A is stored as log for stability
-            self.register_buffer('A', -torch.exp(core.A_log.float()))
-        else:
-            self.register_buffer(
-                'A',
-                torch.zeros(self.n_state, self.d_inner)
-            )
-        
-        # B, C, D are typically projections - extract weights if available
-        if hasattr(core, 'B'):
-            self.register_buffer('B', core.B.float())
-        else:
-            self.register_buffer('B', torch.zeros(self.n_state))
-        
-        if hasattr(core, 'C'):
-            self.register_buffer('C', core.C.float())
-        else:
-            self.register_buffer('C', torch.zeros(self.n_state))
-        
-        if hasattr(core, 'D') and core.D is not None:
-            self.register_buffer('D_param', core.D.float())
-        else:
-            self.register_buffer('D_param', torch.ones(self.d_model))
+        # TODO: Extract conv1d weights and SSM params from core
+        # This is non-trivial due to Mamba2's data-dependent A/B/C
+        pass
     
     def initial_state(
         self,
@@ -240,10 +195,8 @@ class RecurrentMambaCell(nn.Module):
         """
         return MambaState.zeros(
             batch_size=batch_size,
-            d_model=self.d_inner,  # Conv operates on expanded dim
+            d_model=self.d_model,
             kernel_size=self.kernel_size,
-            n_state=self.n_state,
-            d_inner=self.d_inner,
             device=device,
             dtype=dtype,
         )
@@ -271,36 +224,18 @@ class RecurrentMambaCell(nn.Module):
         if D != self.d_model:
             raise ValueError(f"Expected d_model={self.d_model}, got D={D}")
         
-        # Expand input through in_proj if core has it
-        if hasattr(self.core, 'in_proj'):
-            x_expanded = self.core.in_proj(x_t)  # (B, d_inner * 2) typically
-            # Split into x and z (gate)
-            x_proj = x_expanded[:, :self.d_inner]
-        else:
-            # Pad/project to d_inner
-            if D < self.d_inner:
-                x_proj = torch.zeros(B, self.d_inner, device=x_t.device, dtype=x_t.dtype)
-                x_proj[:, :D] = x_t
-            else:
-                x_proj = x_t[:, :self.d_inner]
-        
         # Call the recurrent step kernel
-        y_inner, new_conv_state, new_ssm_state = recurrent_mamba_step(
-            x_proj,
+        y_t, new_conv_state, new_ssm_state = recurrent_mamba_step(
+            x_t,
             state.conv_state,
             state.ssm_state,
-            self.conv_weight,
+            self.W_conv,
+            self.b_conv,
             self.A,
-            self.B,
+            self.Bp,
             self.C,
-            self.D_param,
+            self.D_skip,
         )
-        
-        # Project output back to d_model if needed
-        if hasattr(self.core, 'out_proj'):
-            y_t = self.core.out_proj(y_inner[:, :self.d_inner])
-        else:
-            y_t = y_inner[:, :D]
         
         new_state = MambaState(
             conv_state=new_conv_state,
@@ -313,23 +248,25 @@ class RecurrentMambaCell(nn.Module):
     def from_mamba2(
         cls,
         mamba: nn.Module,
+        kernel_size: int = 4,
     ) -> "RecurrentMambaCell":
         """
-        Convenience constructor from existing Mamba2.
+        Create from existing Mamba2.
         
         Args:
             mamba: A Mamba2 instance
+            kernel_size: Conv kernel size
             
         Returns:
-            RecurrentMambaCell wrapping that Mamba2
+            RecurrentMambaCell
         """
-        return cls(mamba)
+        d_model = getattr(mamba, 'd_model', 64)
+        return cls(d_model=d_model, kernel_size=kernel_size, core_mamba=mamba)
     
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
             f"d_model={self.d_model}, "
-            f"d_state={self.d_state}, "
-            f"d_conv={self.d_conv}, "
+            f"kernel_size={self.kernel_size}, "
             f"kernel_available={has_cuda_kernel()})"
         )

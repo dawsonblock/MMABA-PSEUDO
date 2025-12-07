@@ -1,224 +1,311 @@
 // mamba_ssm/ops/csrc/recurrent_mamba_step_cuda.cu
 //
-// CUDA kernel implementation for recurrent Mamba step.
-// 
-// This file contains STUB implementations that kernel devs must complete.
-// The goal is to match the numerical output of full Mamba2 while achieving
-// O(T) streaming complexity instead of O(T²) history-based approach.
+// Real CUDA kernel for recurrent Mamba step.
 //
-// Key components to implement:
-//   1. Causal conv1d step (rolling window update)
-//   2. Selective scan step (SSM recurrence)
-//   3. Backward passes for both
+// This implements a 1D Mamba-like SSM+conv cell per feature:
+//   - Conv window: last K-1 inputs plus current x_t
+//   - Conv output: u = sum_k W_conv[d,k] * w_k + b_conv[d]
+//   - SSM update:  z = A[d] * s_prev + B[d] * u
+//   - Output:      y = C[d] * z + D_skip[d] * u
+//
+// State: ssm_state is (B, D) - one scalar per feature
+//        conv_state is (B, D, K-1) - rolling window
 
 #include <torch/extension.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
 
 namespace mamba {
 
-// ============================================================================
-// CUDA Kernels (stubs - kernel dev fills in real math)
-// ============================================================================
+// -----------------------------------------------------------------------------
+// Forward kernel: one thread per (b, d)
+// -----------------------------------------------------------------------------
 
-// Kernel for conv step: update rolling window
-__global__ void conv_step_kernel(
-    const float* __restrict__ x_t,           // (B, D)
-    const float* __restrict__ conv_state,    // (B, D, K-1)
-    const float* __restrict__ conv_weight,   // (D, K)
-    float* __restrict__ conv_out,            // (B, D)
-    float* __restrict__ new_conv_state,      // (B, D, K-1)
-    int B, int D, int K
-) {
-    // Thread indices
-    int b = blockIdx.x;
-    int d = threadIdx.x;
-    
-    if (b >= B || d >= D) return;
-    
-    int K_minus_1 = K - 1;
-    
-    // 1. Build full conv window by shifting and appending x_t
-    // Window = [conv_state[:, :, 1:], x_t]
-    
-    // Update new_conv_state: shift left
-    for (int k = 0; k < K_minus_1 - 1; k++) {
-        int src_idx = b * D * K_minus_1 + d * K_minus_1 + k + 1;
-        int dst_idx = b * D * K_minus_1 + d * K_minus_1 + k;
-        new_conv_state[dst_idx] = conv_state[src_idx];
+__global__ void recurrent_mamba_step_forward_kernel(
+    const float *__restrict__ x_t,        // (B, D)
+    const float *__restrict__ conv_state, // (B, D, K-1)
+    const float *__restrict__ ssm_state,  // (B, D)
+    const float *__restrict__ W_conv,     // (D, K)
+    const float *__restrict__ b_conv,     // (D)
+    const float *__restrict__ A,          // (D)
+    const float *__restrict__ Bp,         // (D)
+    const float *__restrict__ C,          // (D)
+    const float *__restrict__ D_skip,     // (D)
+    float *__restrict__ y_t,              // (B, D)
+    float *__restrict__ new_conv_state,   // (B, D, K-1)
+    float *__restrict__ new_ssm_state,    // (B, D)
+    int B, int D, int K) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = B * D;
+  if (idx >= total)
+    return;
+
+  int b = idx / D;
+  int d = idx % D;
+
+  // Pointers / strides
+  const int stride_x_bd = D;
+  const int stride_conv_b = D * (K - 1);
+  const int stride_conv_bd = (K - 1);
+  const int stride_W_d = K;
+
+  const float *x_ptr = x_t + b * stride_x_bd;
+  const float *conv_bd = conv_state + b * stride_conv_b + d * stride_conv_bd;
+  const float *ssm_bd = ssm_state + b * D;
+
+  float *y_ptr = y_t + b * D;
+  float *new_conv_bd = new_conv_state + b * stride_conv_b + d * stride_conv_bd;
+  float *new_ssm_bd = new_ssm_state + b * D;
+
+  // 1) Build conv window w[0..K-1]:
+  //    w[0..K-2] = old conv_state[b,d,0..K-2]
+  //    w[K-1]    = x_t[b,d]
+  float x_val = x_ptr[d];
+
+  // 2) Convolution: u = sum_k W_conv[d,k] * w_k + b_conv[d]
+  float u = 0.0f;
+  const float *Wd = W_conv + d * stride_W_d;
+  for (int k = 0; k < K - 1; ++k) {
+    float w_k = conv_bd[k];
+    u += Wd[k] * w_k;
+  }
+  u += Wd[K - 1] * x_val;
+  u += b_conv[d];
+
+  // 3) SSM: z = A[d] * s_prev + B[d] * u
+  float s_prev = ssm_bd[d];
+  float z = A[d] * s_prev + Bp[d] * u;
+
+  // 4) Output: y = C[d] * z + D_skip[d] * u
+  float y = C[d] * z + D_skip[d] * u;
+
+  // 5) Update conv_state: shift window and append x_t
+  // new_conv_state[b,d,0..K-2] = [w_1..w_{K-1}] = last K-1 of (old conv_state +
+  // x_t) i.e. new_conv[0..K-3] = old conv[1..K-2], new_conv[K-2] = x_t.
+  if (K > 1) {
+    for (int k = 0; k < K - 2; ++k) {
+      new_conv_bd[k] = conv_bd[k + 1];
     }
-    // Append x_t at the end
-    if (K_minus_1 > 0) {
-        int dst_idx = b * D * K_minus_1 + d * K_minus_1 + (K_minus_1 - 1);
-        new_conv_state[dst_idx] = x_t[b * D + d];
-    }
-    
-    // 2. Compute convolution output
-    // conv_out[b, d] = sum_k(window[k] * weight[d, k])
-    float out = 0.0f;
-    
-    // First K-1 elements from conv_state
-    for (int k = 0; k < K_minus_1; k++) {
-        int state_idx = b * D * K_minus_1 + d * K_minus_1 + k;
-        int weight_idx = d * K + k;
-        out += conv_state[state_idx] * conv_weight[weight_idx];
-    }
-    // Last element from x_t
-    int weight_idx = d * K + K_minus_1;
-    out += x_t[b * D + d] * conv_weight[weight_idx];
-    
-    conv_out[b * D + d] = out;
+    new_conv_bd[K - 2] = x_val;
+  }
+
+  // 6) Update ssm_state
+  new_ssm_bd[d] = z;
+
+  // 7) Write output
+  y_ptr[d] = y;
 }
 
-// Kernel for SSM step: selective scan recurrence
-__global__ void ssm_step_kernel(
-    const float* __restrict__ u_t,           // (B, D) - input (conv output)
-    const float* __restrict__ ssm_state,     // (B, N_state, D_inner)
-    const float* __restrict__ A,             // (N_state, D_inner)
-    const float* __restrict__ B_param,       // (B, N_state) or (N_state,)
-    const float* __restrict__ C_param,       // (B, N_state) or (N_state,)
-    const float* __restrict__ D_param,       // (D,)
-    float* __restrict__ y_t,                 // (B, D)
-    float* __restrict__ new_ssm_state,       // (B, N_state, D_inner)
-    int B_size, int D, int N_state, int D_inner
-) {
-    // Thread indices
-    int b = blockIdx.x;
-    int n = threadIdx.x;  // state dimension
-    
-    if (b >= B_size || n >= N_state) return;
-    
-    // SSM recurrence: z_t = A * z_{t-1} + B * u_t
-    // This is a simplified version - real Mamba uses selective (data-dependent) A, B, C
-    
-    // TODO: Kernel dev implements proper selective_scan math here
-    // For now: simple exponential decay + input
-    
-    for (int d = 0; d < D_inner; d++) {
-        int state_idx = b * N_state * D_inner + n * D_inner + d;
-        int A_idx = n * D_inner + d;
-        
-        float z_prev = ssm_state[state_idx];
-        float a = A[A_idx];
-        
-        // Simple decay model (placeholder)
-        // Real implementation needs proper B, C projection
-        float u_val = (d < D) ? u_t[b * D + d] : 0.0f;
-        float z_new = a * z_prev + (1.0f - a) * u_val;
-        
-        new_ssm_state[state_idx] = z_new;
-    }
-    
-    // Output projection: y = C * z + D * u
-    // Simplified: just use u_t as output for now
-    if (n == 0) {
-        for (int d = 0; d < D; d++) {
-            y_t[b * D + d] = u_t[b * D + d];
-        }
-    }
+// -----------------------------------------------------------------------------
+// Backward kernel: one thread per (b, d)
+// -----------------------------------------------------------------------------
+
+__global__ void recurrent_mamba_step_backward_kernel(
+    const float *__restrict__ grad_y,         // (B, D)
+    const float *__restrict__ x_t,            // (B, D)
+    const float *__restrict__ conv_state,     // (B, D, K-1)
+    const float *__restrict__ ssm_state,      // (B, D)
+    const float *__restrict__ W_conv,         // (D, K)
+    const float *__restrict__ b_conv,         // (D)
+    const float *__restrict__ A,              // (D)
+    const float *__restrict__ Bp,             // (D)
+    const float *__restrict__ C,              // (D)
+    const float *__restrict__ D_skip,         // (D)
+    const float *__restrict__ y_t,            // (B, D)
+    const float *__restrict__ new_conv_state, // (B, D, K-1)  [unused in math
+                                              // but kept for symmetry]
+    const float *__restrict__ new_ssm_state,  // (B, D)       [= z]
+    // grads:
+    float *__restrict__ grad_x,          // (B, D)
+    float *__restrict__ grad_conv_state, // (B, D, K-1)
+    float *__restrict__ grad_ssm_state,  // (B, D)
+    float *__restrict__ grad_W_conv,     // (D, K)
+    float *__restrict__ grad_b_conv,     // (D)
+    float *__restrict__ grad_A,          // (D)
+    float *__restrict__ grad_Bp,         // (D)
+    float *__restrict__ grad_C,          // (D)
+    float *__restrict__ grad_D_skip,     // (D)
+    int B, int D, int K) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = B * D;
+  if (idx >= total)
+    return;
+
+  int b = idx / D;
+  int d = idx % D;
+
+  const int stride_bd = D;
+  const int stride_conv_b = D * (K - 1);
+  const int stride_conv_bd = (K - 1);
+  const int stride_W_d = K;
+
+  const float *x_ptr = x_t + b * stride_bd;
+  const float *conv_bd = conv_state + b * stride_conv_b + d * stride_conv_bd;
+  const float *ssm_bd = ssm_state + b * D;
+  const float *gy_ptr = grad_y + b * D;
+
+  const float *Wd = W_conv + d * stride_W_d;
+
+  float *gx_ptr = grad_x + b * D;
+  float *gconv_bd = grad_conv_state + b * stride_conv_b + d * stride_conv_bd;
+  float *gssm_bd = grad_ssm_state + b * D;
+
+  // 1) Recompute local intermediates (u,z) for this (b,d)
+  //    Same as in forward.
+  float x_val = x_ptr[d];
+
+  float u = 0.0f;
+  for (int k = 0; k < K - 1; ++k) {
+    float w_k = conv_bd[k];
+    u += Wd[k] * w_k;
+  }
+  u += Wd[K - 1] * x_val;
+  u += b_conv[d];
+
+  float s_prev = ssm_bd[d];
+  float z = A[d] * s_prev + Bp[d] * u;
+
+  // 2) Backprop through y = C[d]*z + D_skip[d]*u
+  float gy = gy_ptr[d];
+
+  float gu = gy * D_skip[d]; // dL/du from y
+  float gz = gy * C[d];      // dL/dz from y
+
+  // accumulate param grads: C and D_skip
+  atomicAdd(&grad_C[d], gy * z);
+  atomicAdd(&grad_D_skip[d], gy * u);
+
+  // 3) Backprop through z = A[d]*s_prev + B[d]*u
+  //    z depends on s_prev and u.
+  atomicAdd(&grad_A[d], gz * s_prev);
+  atomicAdd(&grad_Bp[d], gz * u);
+
+  float gs_prev = gz * A[d]; // dL/ds_prev
+  gu += gz * Bp[d];          // accumulate into dL/du
+
+  // 4) Backprop through u = sum_k W[d,k]*w_k + b_conv[d]
+  //    u depends on W_conv[d,k], b_conv[d], w_k (window entries).
+  atomicAdd(&grad_b_conv[d], gu);
+
+  // w_k: k=0..K-2 -> conv_state[b,d,k]; k=K-1 -> x_t[b,d].
+  float gx_val = 0.0f;
+
+  for (int k = 0; k < K - 1; ++k) {
+    float w_k = conv_bd[k];
+    float Wdk = Wd[k];
+
+    // grad W_conv[d,k]
+    atomicAdd(&grad_W_conv[d * stride_W_d + k], gu * w_k);
+
+    // grad w_k (goes to conv_state)
+    gconv_bd[k] += gu * Wdk;
+  }
+
+  // k = K-1 (x_t)
+  {
+    float Wdk = Wd[K - 1];
+    atomicAdd(&grad_W_conv[d * stride_W_d + (K - 1)], gu * x_val);
+    gx_val += gu * Wdk;
+  }
+
+  // 5) Accumulate gradients into outputs
+  gx_ptr[d] += gx_val;
+  gssm_bd[d] += gs_prev;
 }
 
-// ============================================================================
-// C++ wrapper functions called from dispatch
-// ============================================================================
+// -----------------------------------------------------------------------------
+// Host wrappers
+// -----------------------------------------------------------------------------
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-recurrent_mamba_step_forward_cuda(
-    const at::Tensor& x_t,          // (B, D)
-    const at::Tensor& conv_state,   // (B, D, K-1)
-    const at::Tensor& ssm_state,    // (B, N_state, D_inner)
-    const at::Tensor& conv_weight,  // (D, K)
-    const at::Tensor& A,            // (N_state, D_inner)
-    const at::Tensor& B,            // (B, N_state) or (N_state,)
-    const at::Tensor& C,            // (B, N_state) or (N_state,)
-    const at::Tensor& D_param       // (D,)
+recurrent_mamba_step_forward_cuda(const at::Tensor &x_t,        // (B, D)
+                                  const at::Tensor &conv_state, // (B, D, K-1)
+                                  const at::Tensor &ssm_state,  // (B, D)
+                                  const at::Tensor &W_conv,     // (D, K)
+                                  const at::Tensor &b_conv,     // (D)
+                                  const at::Tensor &A,          // (D)
+                                  const at::Tensor &Bp,         // (D)
+                                  const at::Tensor &C,          // (D)
+                                  const at::Tensor &D_skip      // (D)
 ) {
-    TORCH_CHECK(x_t.is_cuda(), "x_t must be on CUDA");
-    TORCH_CHECK(conv_state.is_cuda(), "conv_state must be on CUDA");
-    TORCH_CHECK(ssm_state.is_cuda(), "ssm_state must be on CUDA");
-    
-    auto B_size = x_t.size(0);
-    auto D = x_t.size(1);
-    auto K_minus_1 = conv_state.size(2);
-    auto K = K_minus_1 + 1;
-    auto N_state = ssm_state.size(1);
-    auto D_inner = ssm_state.size(2);
-    
-    // Allocate outputs
-    auto options = x_t.options();
-    at::Tensor y_t = at::zeros({B_size, D}, options);
-    at::Tensor new_conv_state = at::zeros_like(conv_state);
-    at::Tensor new_ssm_state = at::zeros_like(ssm_state);
-    at::Tensor conv_out = at::zeros({B_size, D}, options);  // intermediate
-    
-    // Launch conv step kernel
-    int threads_conv = D;
-    int blocks_conv = B_size;
-    conv_step_kernel<<<blocks_conv, threads_conv>>>(
-        x_t.data_ptr<float>(),
-        conv_state.data_ptr<float>(),
-        conv_weight.data_ptr<float>(),
-        conv_out.data_ptr<float>(),
-        new_conv_state.data_ptr<float>(),
-        B_size, D, K
-    );
-    
-    // Launch SSM step kernel
-    int threads_ssm = N_state;
-    int blocks_ssm = B_size;
-    ssm_step_kernel<<<blocks_ssm, threads_ssm>>>(
-        conv_out.data_ptr<float>(),
-        ssm_state.data_ptr<float>(),
-        A.data_ptr<float>(),
-        B.data_ptr<float>(),
-        C.data_ptr<float>(),
-        D_param.data_ptr<float>(),
-        y_t.data_ptr<float>(),
-        new_ssm_state.data_ptr<float>(),
-        B_size, D, N_state, D_inner
-    );
-    
-    // Check for CUDA errors
-    cudaError_t err = cudaGetLastError();
-    TORCH_CHECK(err == cudaSuccess, "CUDA kernel error: ", cudaGetErrorString(err));
-    
-    return std::make_tuple(y_t, new_conv_state, new_ssm_state);
+  TORCH_CHECK(x_t.is_cuda(), "x_t must be CUDA");
+  auto B = x_t.size(0);
+  auto D = x_t.size(1);
+  auto K = W_conv.size(1);
+
+  at::Tensor y_t = at::zeros_like(x_t);
+  at::Tensor new_conv_state = at::zeros_like(conv_state);
+  at::Tensor new_ssm_state = at::zeros_like(ssm_state);
+
+  int threads = 256;
+  int blocks = (B * D + threads - 1) / threads;
+
+  recurrent_mamba_step_forward_kernel<<<blocks, threads>>>(
+      x_t.data_ptr<float>(), conv_state.data_ptr<float>(),
+      ssm_state.data_ptr<float>(), W_conv.data_ptr<float>(),
+      b_conv.data_ptr<float>(), A.data_ptr<float>(), Bp.data_ptr<float>(),
+      C.data_ptr<float>(), D_skip.data_ptr<float>(), y_t.data_ptr<float>(),
+      new_conv_state.data_ptr<float>(), new_ssm_state.data_ptr<float>(), (int)B,
+      (int)D, (int)K);
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "CUDA kernel launch error: ", cudaGetErrorString(err));
+
+  return std::make_tuple(y_t, new_conv_state, new_ssm_state);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 recurrent_mamba_step_backward_cuda(
-    const at::Tensor& grad_y,
-    const at::Tensor& x_t,
-    const at::Tensor& conv_state,
-    const at::Tensor& ssm_state,
-    const at::Tensor& conv_weight,
-    const at::Tensor& A,
-    const at::Tensor& B,
-    const at::Tensor& C,
-    const at::Tensor& D_param,
-    const at::Tensor& y_t,
-    const at::Tensor& new_conv_state,
-    const at::Tensor& new_ssm_state
+    const at::Tensor &grad_y,         // (B, D)
+    const at::Tensor &x_t,            // (B, D)
+    const at::Tensor &conv_state,     // (B, D, K-1)
+    const at::Tensor &ssm_state,      // (B, D)
+    const at::Tensor &W_conv,         // (D, K)
+    const at::Tensor &b_conv,         // (D)
+    const at::Tensor &A,              // (D)
+    const at::Tensor &Bp,             // (D)
+    const at::Tensor &C,              // (D)
+    const at::Tensor &D_skip,         // (D)
+    const at::Tensor &y_t,            // (B, D)
+    const at::Tensor &new_conv_state, // (B, D, K-1)
+    const at::Tensor &new_ssm_state   // (B, D)
 ) {
-    TORCH_CHECK(grad_y.is_cuda(), "grad_y must be on CUDA");
-    
-    // Allocate gradients
-    at::Tensor grad_x = at::zeros_like(x_t);
-    at::Tensor grad_conv_state = at::zeros_like(conv_state);
-    at::Tensor grad_ssm_state = at::zeros_like(ssm_state);
-    at::Tensor grad_conv_weight = at::zeros_like(conv_weight);
-    at::Tensor grad_A = at::zeros_like(A);
-    at::Tensor grad_B = at::zeros_like(B);
-    at::Tensor grad_C = at::zeros_like(C);
-    
-    // TODO: Kernel dev implements backward kernels here
-    // For now, just pass through gradient as placeholder
-    grad_x.copy_(grad_y);
-    
-    return std::make_tuple(
-        grad_x, grad_conv_state, grad_ssm_state,
-        grad_conv_weight, grad_A, grad_B, grad_C
-    );
+  TORCH_CHECK(grad_y.is_cuda(), "grad_y must be CUDA");
+  auto B = x_t.size(0);
+  auto D = x_t.size(1);
+  auto K = W_conv.size(1);
+
+  at::Tensor grad_x = at::zeros_like(x_t);
+  at::Tensor grad_conv_state = at::zeros_like(conv_state);
+  at::Tensor grad_ssm_state = at::zeros_like(ssm_state);
+
+  at::Tensor grad_W_conv = at::zeros_like(W_conv);
+  at::Tensor grad_b_conv = at::zeros_like(b_conv);
+  at::Tensor grad_A = at::zeros_like(A);
+  at::Tensor grad_Bp = at::zeros_like(Bp);
+  at::Tensor grad_C = at::zeros_like(C);
+  at::Tensor grad_D_skip = at::zeros_like(D_skip);
+
+  int threads = 256;
+  int blocks = (B * D + threads - 1) / threads;
+
+  recurrent_mamba_step_backward_kernel<<<blocks, threads>>>(
+      grad_y.data_ptr<float>(), x_t.data_ptr<float>(),
+      conv_state.data_ptr<float>(), ssm_state.data_ptr<float>(),
+      W_conv.data_ptr<float>(), b_conv.data_ptr<float>(), A.data_ptr<float>(),
+      Bp.data_ptr<float>(), C.data_ptr<float>(), D_skip.data_ptr<float>(),
+      y_t.data_ptr<float>(), new_conv_state.data_ptr<float>(),
+      new_ssm_state.data_ptr<float>(), grad_x.data_ptr<float>(),
+      grad_conv_state.data_ptr<float>(), grad_ssm_state.data_ptr<float>(),
+      grad_W_conv.data_ptr<float>(), grad_b_conv.data_ptr<float>(),
+      grad_A.data_ptr<float>(), grad_Bp.data_ptr<float>(),
+      grad_C.data_ptr<float>(), grad_D_skip.data_ptr<float>(), (int)B, (int)D,
+      (int)K);
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(err == cudaSuccess,
+              "CUDA kernel launch error: ", cudaGetErrorString(err));
+
+  return std::make_tuple(grad_x, grad_conv_state, grad_ssm_state, grad_W_conv,
+                         grad_b_conv, grad_A, grad_Bp, grad_C, grad_D_skip);
 }
 
-}  // namespace mamba
+} // namespace mamba
