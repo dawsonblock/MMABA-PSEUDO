@@ -1,104 +1,98 @@
-# Neural Memory Mamba Integration (MMABA-PSEUDO)
+# MMABA-PSEUDO: Mamba 2 Neural Memory Benchmark
 
-This repository benchmarks **Neural Memory** architectures using **Mamba2** (or GRU) controllers paired with **Pseudomode Memory** for long-horizon Reinforcement Learning tasks.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dawsonblock/MMABA-PSEUDO/blob/main/colab/MMABA_Colab.ipynb)
 
-It is designed to be a drop-in benchmark suite for testing memory capabilities in RL agents, supporting tasks like **Delayed Cue**, **Copy Memory**, **Associative Recall**, and **T-Maze**.
+A benchmark suite for testing **long-horizon memory capabilities** in reinforcement learning agents using **Mamba 2** state-space models.
 
-## Key Features
+## Features
 
-*   **Dual Controller Support**: Run with either `gru` (standard RNN) or `mamba` (State Space Model).
-*   **Pseudomode Memory**: An external long-term memory module that allows the agent to store and retrieve information over long horizons.
-*   **Full Mac/MPS Support**: Mamba 2 runs natively on Apple Silicon (M1/M2/M3) via a pure PyTorch compatibility layer.
-    *   No CUDA or Triton required.
-    *   Automatically patches `mamba_ssm` to use reference PyTorch implementations.
-    *   Import `mamba_compat` at the top of your script to enable MPS support.
-*   **Vectorized Environments**: Fast, pure-PyTorch implementations of memory tasks.
-*   **Recurrent PPO**: A PPO implementation optimized for recurrent policies with full-sequence evaluation.
+- 🧠 **Mamba 2 Controller** — State-space model for efficient sequence processing
+- 💾 **PseudoMode Memory** — External memory bank with K slots for long-term storage
+- 🎮 **4 Benchmark Tasks** — Delayed cue, copy memory, associative recall, T-maze
+- 🍎 **MPS Compatible** — Runs on Apple Silicon via pure PyTorch fallbacks
+- 🚀 **CUDA Optimized** — 10-50x faster on GPU with Triton kernels
 
-## Installation
+## Project Structure
 
-1.  **Clone the repository**:
-    ```bash
-    git clone https://github.com/dawsonblock/MMABA-PSEUDO.git
-    cd MMABA-PSEUDO
-    ```
+```
+MMABA-PSEUDO/
+├── src/                    # Core source code
+│   ├── neural_memory_long_ppo.py  # Main training script
+│   ├── mem_actor_critic_mamba.py  # Actor-critic with Mamba
+│   ├── neural_memory_final.py     # Vectorized environments
+│   ├── mamba_compat.py            # MPS/CPU compatibility layer
+│   └── wandb_integration.py       # Weights & Biases logging
+├── docs/                   # Documentation
+│   ├── TRAINING.md         # Training guide
+│   └── RESULTS.md          # Experiment results
+├── colab/                  # Google Colab notebooks
+│   └── MMABA_Colab.ipynb   # Interactive training notebook
+├── scripts/                # Build and run scripts
+│   ├── unified_build.sh    # Dependency installer
+│   └── run_docker.sh       # Docker runner
+├── mamba-main/             # Patched Mamba SSM library
+├── Dockerfile              # Container definition
+├── docker-compose.yml      # Docker compose config
+└── requirements.txt        # Python dependencies
+```
 
-2.  **Install Dependencies**:
-    ```bash
-    pip install torch numpy wandb einops
-    ```
+## Quick Start
 
-3.  **Install Mamba (editable mode)**:
-    ```bash
-    cd mamba-main
-    pip install -e . --no-build-isolation
-    cd ..
-    ```
-    > **Note**: The `mamba-main` package has been patched to remove Triton dependencies for macOS compatibility.
+### Option 1: Google Colab (Recommended)
 
-## Usage
+Click the badge above to run on free GPU!
 
-### Training on Mac (MPS)
+### Option 2: Local Installation
 
 ```bash
-python3 neural_memory_long_ppo.py \
+# Clone repository
+git clone https://github.com/dawsonblock/MMABA-PSEUDO.git
+cd MMABA-PSEUDO
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Install Mamba (skip CUDA build on Mac)
+cd mamba-main && MAMBA_SKIP_CUDA_BUILD=TRUE pip install -e . && cd ..
+
+# Run training
+cd src
+python neural_memory_long_ppo.py \
     --task delayed_cue \
     --controller mamba \
-    --device mps \
-    --num-envs 4 \
+    --device mps \      # or cuda
+    --num-envs 4 \      # 64 for CUDA
     --total-updates 2000
 ```
 
-> **Recommended**: Use `--num-envs 4` on Mac to avoid MPS memory limits.
-
-### Training on CUDA
+### Option 3: Docker
 
 ```bash
-python3 neural_memory_long_ppo.py \
-    --task delayed_cue \
-    --controller mamba \
-    --device cuda \
-    --num-envs 64 \
-    --total-updates 2000
+docker-compose up --build
 ```
 
-### Command Line Arguments
+## Tasks
 
-| Argument | Description | Default |
-| :--- | :--- | :--- |
-| `--task` | Task: `delayed_cue`, `copy_memory`, `assoc_recall`, `tmaze` | `delayed_cue` |
-| `--controller` | Controller type: `gru` or `mamba` | `gru` |
-| `--device` | Device: `cuda`, `mps`, or `cpu` | `cuda` |
-| `--horizon` | Task horizon (difficulty) | `200` |
-| `--num-envs` | Number of parallel environments | `64` |
-| `--rollout-length` | PPO rollout length (should be > horizon) | `256` |
-| `--track` | Enable Weights & Biases logging | `False` |
+| Task | Description | Horizon |
+|:--|:--|:--|
+| `delayed_cue` | Remember signal for N steps | 200 |
+| `copy_memory` | Memorize and reproduce sequence | 240 |
+| `assoc_recall` | Learn key→value pairs | 216 |
+| `tmaze` | Navigate using start hint | 1002 |
 
-## File Structure
+## Performance
 
-| File | Description |
-| :--- | :--- |
-| `neural_memory_long_ppo.py` | Main training script with PPO loop |
-| `mem_actor_critic_mamba.py` | Agent, PseudoModeMemory, and Mamba2 integration |
-| `mamba_compat.py` | **MPS/CPU compatibility layer** for Mamba 2 |
-| `neural_memory_final.py` | Vectorized environment implementations |
-| `mamba-main/` | Patched Mamba SSM library (Triton-free) |
+| Device | Time per 2000 updates | Batch Size |
+|:--|:--|:--|
+| **CUDA (T4)** | ~1-2 hours | 64 envs |
+| **MPS (M1/M2)** | ~13-20 hours | 4 envs |
+| **CPU** | ~7-14 days | 1 env |
 
-## Mamba MPS Compatibility
+## Documentation
 
-The `mamba_compat.py` module provides a compatibility layer for running Mamba 2 on non-CUDA devices:
-
-- **Mocks Triton**: Prevents import errors on macOS.
-- **Patches Kernels**: Replaces CUDA-specific functions with PyTorch equivalents.
-- **Auto-Activates**: Automatically applies patches when CUDA is unavailable.
-
-To use Mamba on MPS, ensure `mamba_compat` is imported **before** any Mamba modules:
-
-```python
-import mamba_compat  # Must be first!
-from mamba_ssm.modules.mamba2 import Mamba2
-```
+- [Training Guide](docs/TRAINING.md) — Hyperparameters, usage, troubleshooting
+- [Results](docs/RESULTS.md) — Experiment results and analysis
 
 ## License
 
-[MIT License](LICENSE)
+MIT License
