@@ -307,10 +307,13 @@ class MemActorCritic(nn.Module):
             # For true Mamba state caching, Mamba2 would need to be modified
             # to accept and return internal state tensors.
             ctrl_in_seq = ctrl_in.unsqueeze(1)           # (B, 1, H+M)
-            h_seq = self.controller(ctrl_in_seq)         # (B, 1, H+M)
-            h_full = h_seq.squeeze(1)                    # (B, H+M)
+            h_seq = self.controller(ctrl_in_seq)         # (B, 1, d_model)
+            h_full = h_seq.squeeze(1)                    # (B, d_model)
 
-            # Split back into (H, M) chunks: first H dims = new h, last M dims reused for mem interface
+            # Mamba d_model = hidden_size + memory_dim (must match ctrl_input_dim)
+            # Split back into (H, M) chunks for downstream use
+            assert h_full.shape[-1] >= self.hidden_size + self.memory_dim, \
+                f"Mamba output dim {h_full.shape[-1]} < expected {self.hidden_size + self.memory_dim}"
             h = h_full[:, : self.hidden_size]
             read_vec = h_full[:, self.hidden_size : self.hidden_size + self.memory_dim]
         else:

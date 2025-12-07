@@ -548,7 +548,8 @@ class PPOTrainer:
             # Log memory usage histogram if available
             if "final_mem_usage" in info and info["final_mem_usage"] is not None:
                 mem_usage = info["final_mem_usage"].flatten().cpu().numpy()
-                log_data["train/mem_usage_hist"] = wlog.wandb.Histogram(mem_usage)
+                if wlog.wandb is not None and hasattr(wlog.wandb, 'Histogram'):
+                    log_data["train/mem_usage_hist"] = wlog.wandb.Histogram(mem_usage)
 
             wlog.log_metrics(self.global_step, log_data, run=self.run)
 
