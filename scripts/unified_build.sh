@@ -10,27 +10,27 @@ echo "========================================"
 echo "   Neural Memory Mamba Build Script"
 echo "========================================"
 
-# Get the absolute path of the script directory
+# Get the absolute path of the script directory and project root
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-MAMBA_DIR="$SCRIPT_DIR/mamba-main"
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+MAMBA_DIR="$PROJECT_ROOT/mamba-main"
+SRC_DIR="$PROJECT_ROOT/src"
 
-echo "[*] Root directory: $SCRIPT_DIR"
+echo "[*] Project root: $PROJECT_ROOT"
+echo "[*] Source directory: $SRC_DIR"
 echo "[*] Mamba directory: $MAMBA_DIR"
 
 # 1. Install root dependencies
 echo ""
 echo "[1/3] Installing root dependencies..."
-pip3 install -r "$SCRIPT_DIR/requirements.txt"
+pip3 install -r "$PROJECT_ROOT/requirements.txt"
 echo "[+] Root dependencies installed."
 
 # 2. Check for Mamba directory
 if [ -d "$MAMBA_DIR" ]; then
     echo "[*] Found mamba-main at $MAMBA_DIR"
-elif [ -d "$SCRIPT_DIR/../mamba-main" ]; then
-    MAMBA_DIR="$SCRIPT_DIR/../mamba-main"
-    echo "[*] Found mamba-main at $MAMBA_DIR"
 else
-    echo "[-] Error: mamba-main directory not found at $MAMBA_DIR or ../mamba-main"
+    echo "[-] Error: mamba-main directory not found at $MAMBA_DIR"
     exit 1
 fi
 
@@ -48,7 +48,7 @@ if [ "$OS" == "Darwin" ]; then
     cd "$MAMBA_DIR"
     export MAMBA_SKIP_CUDA_BUILD=TRUE
     pip3 install -e .
-    cd "$SCRIPT_DIR"
+    cd "$PROJECT_ROOT"
     
     echo "[+] Setup complete for Mac."
 else
@@ -56,13 +56,8 @@ else
     
     cd "$MAMBA_DIR"
     
-    # Check if we should run the full build.sh or just pip install
-    # The user requested to use build.sh logic, but build.sh builds a wheel.
-    # For local dev, pip install -e . is usually better.
-    
     echo "[*] Running pip3 install -e . in $MAMBA_DIR"
     
-    # Set build flags if needed (optional, derived from build.sh)
     export MAX_JOBS=4
     
     if pip3 install -e .; then
@@ -72,17 +67,19 @@ else
         echo "[*] Falling back to MockMamba2 (GRU) mode."
     fi
     
-    cd "$SCRIPT_DIR"
+    cd "$PROJECT_ROOT"
 fi
 
 echo ""
 echo "[3/3] Verifying installation..."
 python3 -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+cd "$SRC_DIR"
 python3 -c "import neural_memory_long_ppo; print('Neural Memory PPO script imports successfully.')"
+cd "$PROJECT_ROOT"
 
 echo ""
 echo "========================================"
 echo "   Build Complete!"
 echo "========================================"
 echo "Run the training with:"
-echo "python3 neural_memory_long_ppo.py --task delayed_cue --controller mamba --track"
+echo "cd src && python3 neural_memory_long_ppo.py --task delayed_cue --controller mamba --device cuda"

@@ -1,4 +1,4 @@
-FROM --platform=linux/arm64 pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
 WORKDIR /app
 
@@ -20,4 +20,7 @@ RUN cd mamba-main && MAMBA_SKIP_CUDA_BUILD=TRUE pip install --no-cache-dir -e . 
 # Switch to non-root user
 USER appuser
 
-CMD ["python3", "neural_memory_long_ppo.py", "--task", "delayed_cue", "--controller", "gru", "--device", "cpu"]
+# Set working directory to src
+WORKDIR /app/src
+
+CMD ["python3", "neural_memory_long_ppo.py", "--task", "delayed_cue", "--controller", "mamba", "--device", "cuda", "--num-envs", "64"]
