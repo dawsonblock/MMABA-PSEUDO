@@ -24,6 +24,11 @@ import torch.nn.functional as F
 _Mamba2: Optional[Type] = None
 _mamba_load_attempted = False
 
+# Lazy-loaded RecurrentMambaCell (only loaded when controller="mamba_recurrent")
+_RecurrentMambaCell: Optional[Type] = None
+_MambaState: Optional[Type] = None
+_recurrent_mamba_load_attempted = False
+
 
 def _ensure_mamba_loaded():
     """
@@ -51,6 +56,42 @@ def _ensure_mamba_loaded():
     except ImportError as e:
         raise RuntimeError(
             f"controller='mamba' requires mamba_ssm to be installed. "
+            f"Install via: cd mamba-main && pip install -e . "
+            f"Original error: {e}"
+        ) from e
+
+
+def _ensure_recurrent_mamba_loaded():
+    """
+    Lazy-load RecurrentMambaCell only when needed.
+    
+    This provides the true O(T) streaming Mamba with state caching.
+    Applies mamba_compat patches before import to avoid triton errors.
+    """
+    global _RecurrentMambaCell, _MambaState, _recurrent_mamba_load_attempted
+    
+    if _recurrent_mamba_load_attempted:
+        if _RecurrentMambaCell is None:
+            raise RuntimeError(
+                "controller='mamba_recurrent' requires mamba_ssm to be installed. "
+                "Install via: cd mamba-main && pip install -e ."
+            )
+        return
+    
+    _recurrent_mamba_load_attempted = True
+    
+    try:
+        # Apply patches before importing from mamba_ssm to avoid triton errors
+        from mamba_compat import patch_mamba_for_cpu
+        patch_mamba_for_cpu()
+        
+        # Now safe to import RecurrentMambaCell
+        from mamba_ssm.recurrent_streaming import RecurrentMambaCell, MambaState
+        _RecurrentMambaCell = RecurrentMambaCell
+        _MambaState = MambaState
+    except ImportError as e:
+        raise RuntimeError(
+            f"controller='mamba_recurrent' requires mamba_ssm to be installed. "
             f"Install via: cd mamba-main && pip install -e . "
             f"Original error: {e}"
         ) from e
@@ -287,6 +328,18 @@ class MemActorCritic(nn.Module):
             # Store d_model for output slicing
             self._mamba_d_model = mamba_d_model
 
+        elif controller_type == "mamba_recurrent":
+            # Lazy-load RecurrentMambaCell for true O(T) streaming
+            _ensure_recurrent_mamba_loaded()
+            
+            # RecurrentMambaCell is a learnable SSM+conv module
+            # Uses hidden_size as d_model (simpler interface than Mamba2)
+            self.controller = _RecurrentMambaCell(
+                d_model=hidden_size,
+                kernel_size=4,
+            )
+            self.mamba_in_proj = None
+
         else:
             raise ValueError(f"Unknown controller_type: {controller_type}")
 
@@ -302,10 +355,18 @@ class MemActorCritic(nn.Module):
     def initial_state(self, batch_size: int, device: torch.device) -> Dict[str, object]:
         """
         Returns the initial recurrent + memory state for PPO.
+        
+        For mamba_recurrent, also includes MambaState.
         """
         h0 = torch.zeros(batch_size, self.hidden_size, device=device)
         mem0 = self.memory.initial_state(batch_size, device=device)
-        return {"h": h0, "mem": mem0}
+        state = {"h": h0, "mem": mem0}
+        
+        if self.controller_type == "mamba_recurrent":
+            mamba_state = self.controller.initial_state(batch_size, device)
+            state["mamba_state"] = mamba_state
+        
+        return state
 
     # -------------------------------------------------------- #
 
@@ -360,6 +421,22 @@ class MemActorCritic(nn.Module):
             # For simplicity, use first hidden_size dims as h, next memory_dim as read_vec
             h = h_full[:, :self.hidden_size]
             read_vec = h_full[:, self.hidden_size:self.hidden_size + self.memory_dim]
+        
+        elif self.controller_type == "mamba_recurrent":
+            # TRUE RECURRENT: RecurrentMambaCell with state caching
+            # This preserves internal SSM state across timesteps (unlike mamba)
+            
+            # Use only encoded observation as input (not read_vec, to match GRU interface)
+            # The hidden state h captures the SSM output
+            mamba_input = x  # (B, H) - obs_encoded
+            mamba_state = state["mamba_state"]
+            
+            h, mamba_state = self.controller(mamba_input, mamba_state)  # (B, H), MambaState
+            
+            # Store updated mamba_state for next_state
+            # This is the key difference from "mamba" - state is cached!
+            self._last_mamba_state = mamba_state
+            
         else:
             raise RuntimeError("Invalid controller_type at runtime")
 
@@ -375,6 +452,11 @@ class MemActorCritic(nn.Module):
         value = self.value_head(joint).squeeze(-1)  # (B,)
 
         next_state = {"h": h, "mem": mem_state}
+        
+        # Include MambaState for mamba_recurrent controller
+        if self.controller_type == "mamba_recurrent":
+            next_state["mamba_state"] = self._last_mamba_state
+        
         extras = {
             "read_vec": read_vec,
             "gate_mean": gate.mean().item(),  # For logging

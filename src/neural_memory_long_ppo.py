@@ -129,17 +129,22 @@ class PPOTrainer:
         h: torch.Tensor,
         mem_state: Any,
         done: torch.Tensor,
-    ) -> Tuple[torch.Tensor, Any]:
+        mamba_state: Any = None,
+    ) -> Tuple[torch.Tensor, Any, Any]:
         """
-        Zero recurrent + pseudomode state where `done` is True.
+        Zero recurrent + pseudomode + mamba state where `done` is True.
 
         h:        (B, H)
         mem_state.modes: (B, K, D)
         mem_state.usage: (B, K)
+        mamba_state: Optional MambaState (for mamba_recurrent)
         done:     (B,) bool
+        
+        Returns:
+            h, mem_state, mamba_state (all zeroed where done)
         """
         if done is None:
-            return h, mem_state
+            return h, mem_state, mamba_state
 
         mask = (~done).float().unsqueeze(-1)  # (B, 1)
 
@@ -151,7 +156,12 @@ class PPOTrainer:
         usage = mem_state.usage * mask  # broadcast over K
 
         mem_state = type(mem_state)(modes=modes, usage=usage)
-        return h, mem_state
+        
+        # Handle MambaState if present
+        if mamba_state is not None:
+            mamba_state = mamba_state.mask_done(done)
+        
+        return h, mem_state, mamba_state
 
     # ------------------------------------------------------------------ #
 
@@ -197,16 +207,24 @@ class PPOTrainer:
             "mem_usage": state["mem"].usage.detach().clone(),     # (B, K)
         }
         
+        # Save MambaState if present (for mamba_recurrent)
+        if "mamba_state" in state:
+            init_state["mamba_conv_state"] = state["mamba_state"].conv_state.detach().clone()
+            init_state["mamba_ssm_state"] = state["mamba_state"].ssm_state.detach().clone()
+        
         # Track final memory usage for logging
         final_mem_usage = None
 
         for t in range(T):
-            # Mask recurrent + memory state where previous step was done
-            h_masked, mem_masked = self._mask_state_on_done(
-                state["h"], state["mem"], done_prev
+            # Mask recurrent + memory + mamba state where previous step was done
+            mamba_state = state.get("mamba_state", None)
+            h_masked, mem_masked, mamba_masked = self._mask_state_on_done(
+                state["h"], state["mem"], done_prev, mamba_state
             )
             state["h"] = h_masked
             state["mem"] = mem_masked
+            if mamba_masked is not None:
+                state["mamba_state"] = mamba_masked
 
             with torch.no_grad():
                 logits, value, next_state, gate, extras = self.agent(obs, state)
@@ -303,7 +321,7 @@ class PPOTrainer:
         init_state: Dict[str, torch.Tensor],
     ) -> Dict[str, Any]:
         """
-        Rebuild the initial recurrent + memory state from stored tensors.
+        Rebuild the initial recurrent + memory + mamba state from stored tensors.
         """
         h0 = init_state["h"]                      # (B, H)
         modes0 = init_state["mem_modes"]          # (B, K, D)
@@ -314,7 +332,18 @@ class PPOTrainer:
 
         # CRITICAL: Detach tensors to prevent gradient leakage across episodes
         mem0 = PseudoModeState(modes=modes0.detach().clone(), usage=usage0.detach().clone())
-        return {"h": h0.detach().clone(), "mem": mem0}
+        state = {"h": h0.detach().clone(), "mem": mem0}
+        
+        # Reconstruct MambaState if stored (for mamba_recurrent controller)
+        if "mamba_conv_state" in init_state:
+            from mamba_ssm.recurrent_streaming import MambaState
+            mamba_state = MambaState(
+                conv_state=init_state["mamba_conv_state"].detach().clone(),
+                ssm_state=init_state["mamba_ssm_state"].detach().clone(),
+            )
+            state["mamba_state"] = mamba_state
+        
+        return state
 
     # ------------------------------------------------------------------ #
 
@@ -341,10 +370,15 @@ class PPOTrainer:
         gate_seq = torch.zeros(T, B, device=device)
 
         for t in range(T):
-            # Mask on previous done
-            state["h"], state["mem"] = self._mask_state_on_done(
-                state["h"], state["mem"], done_prev
+            # Mask on previous done (including mamba_state if present)
+            mamba_state = state.get("mamba_state", None)
+            h_masked, mem_masked, mamba_masked = self._mask_state_on_done(
+                state["h"], state["mem"], done_prev, mamba_state
             )
+            state["h"] = h_masked
+            state["mem"] = mem_masked
+            if mamba_masked is not None:
+                state["mamba_state"] = mamba_masked
 
             logits, value, state, gate, extras = self.agent(obs[t], state)
             
@@ -616,7 +650,7 @@ def make_argparser() -> argparse.ArgumentParser:
         "--controller",
         type=str,
         default="gru",
-        choices=["gru", "mamba"],  # add "bamba" later if you wire it
+        choices=["gru", "mamba", "mamba_recurrent"],
     )
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--memory-slots", type=int, default=16)
