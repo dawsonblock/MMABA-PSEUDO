@@ -14,19 +14,46 @@ except for the import.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, Type
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from mamba_compat import patch_mamba_for_cpu
-    patch_mamba_for_cpu()
-    from mamba_ssm.modules.mamba2 import Mamba2
-except ImportError:
-    print("Error: mamba_ssm not found. Please install it or check your environment.")
-    Mamba2 = None
+# Lazy-loaded Mamba2 class (only loaded when controller="mamba")
+_Mamba2: Optional[Type] = None
+_mamba_load_attempted = False
+
+
+def _ensure_mamba_loaded():
+    """
+    Lazy-load Mamba2 only when needed.
+    
+    This prevents import errors and noisy output when using GRU controller.
+    """
+    global _Mamba2, _mamba_load_attempted
+    
+    if _mamba_load_attempted:
+        if _Mamba2 is None:
+            raise RuntimeError(
+                "controller='mamba' requires mamba_ssm to be installed. "
+                "Install via: cd mamba-main && pip install -e ."
+            )
+        return
+    
+    _mamba_load_attempted = True
+    
+    try:
+        from mamba_compat import patch_mamba_for_cpu
+        patch_mamba_for_cpu()
+        from mamba_ssm.modules.mamba2 import Mamba2
+        _Mamba2 = Mamba2
+    except ImportError as e:
+        raise RuntimeError(
+            f"controller='mamba' requires mamba_ssm to be installed. "
+            f"Install via: cd mamba-main && pip install -e . "
+            f"Original error: {e}"
+        ) from e
 
 
 # ============================================================
@@ -234,17 +261,31 @@ class MemActorCritic(nn.Module):
 
         if controller_type == "gru":
             self.controller = nn.GRUCell(ctrl_input_dim, hidden_size)
+            self.mamba_in_proj = None
 
         elif controller_type == "mamba":
-            if Mamba2 is None:
-                raise ImportError("mamba_ssm is not installed. Cannot use mamba controller.")
+            # Lazy-load Mamba2 only when actually needed
+            _ensure_mamba_loaded()
+            
+            # Mamba2 requires d_model divisible by headdim * expand (typically 128)
+            # Use a projection layer if ctrl_input_dim doesn't meet this constraint
+            mamba_d_model = max(128, ((ctrl_input_dim + 127) // 128) * 128)  # Round up to 128
+            
+            if ctrl_input_dim != mamba_d_model:
+                self.mamba_in_proj = nn.Linear(ctrl_input_dim, mamba_d_model)
+            else:
+                self.mamba_in_proj = None
+            
             # Mamba2 processes sequences (B, T, D). We'll use T=1 per step.
-            self.controller = Mamba2(
-                d_model=ctrl_input_dim,
+            self.controller = _Mamba2(
+                d_model=mamba_d_model,
                 d_state=16,
                 d_conv=4,
                 expand=2,
             )
+            
+            # Store d_model for output slicing
+            self._mamba_d_model = mamba_d_model
 
         else:
             raise ValueError(f"Unknown controller_type: {controller_type}")
@@ -304,18 +345,21 @@ class MemActorCritic(nn.Module):
             # LIMITATION: This means Mamba's internal convolution state is NOT
             # preserved across timesteps. The recurrence is handled by the
             # external PseudoModeMemory, not Mamba's internal SSM state.
-            # For true Mamba state caching, Mamba2 would need to be modified
-            # to accept and return internal state tensors.
-            ctrl_in_seq = ctrl_in.unsqueeze(1)           # (B, 1, H+M)
-            h_seq = self.controller(ctrl_in_seq)         # (B, 1, d_model)
-            h_full = h_seq.squeeze(1)                    # (B, d_model)
+            
+            # Project input to Mamba d_model if needed
+            if self.mamba_in_proj is not None:
+                ctrl_in_proj = self.mamba_in_proj(ctrl_in)  # (B, d_model)
+            else:
+                ctrl_in_proj = ctrl_in
+            
+            ctrl_in_seq = ctrl_in_proj.unsqueeze(1)       # (B, 1, d_model)
+            h_seq = self.controller(ctrl_in_seq)           # (B, 1, d_model)
+            h_full = h_seq.squeeze(1)                      # (B, d_model)
 
-            # Mamba d_model = hidden_size + memory_dim (must match ctrl_input_dim)
-            # Split back into (H, M) chunks for downstream use
-            assert h_full.shape[-1] >= self.hidden_size + self.memory_dim, \
-                f"Mamba output dim {h_full.shape[-1]} < expected {self.hidden_size + self.memory_dim}"
-            h = h_full[:, : self.hidden_size]
-            read_vec = h_full[:, self.hidden_size : self.hidden_size + self.memory_dim]
+            # Extract h and read_vec from Mamba output
+            # For simplicity, use first hidden_size dims as h, next memory_dim as read_vec
+            h = h_full[:, :self.hidden_size]
+            read_vec = h_full[:, self.hidden_size:self.hidden_size + self.memory_dim]
         else:
             raise RuntimeError("Invalid controller_type at runtime")
 

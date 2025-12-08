@@ -1,0 +1,39 @@
+# Dockerfile.cpu - CPU/MPS-only container without CUDA dependencies
+#
+# Build: docker build -f Dockerfile.cpu -t mmaba-cpu .
+# Run:   docker run --rm mmaba-cpu
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install minimal system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser
+
+# Copy application files
+COPY --chown=appuser:appuser . .
+
+# Install Python dependencies (CPU PyTorch)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir numpy wandb einops
+
+# Install Mamba (CPU-only, skips CUDA)
+RUN cd mamba-main && MAMBA_SKIP_CUDA_BUILD=TRUE pip install --no-cache-dir -e . || echo "Mamba CPU build skipped"
+
+# Switch to non-root user
+USER appuser
+
+# Set working directory to src
+WORKDIR /app/src
+
+# Default: GRU on CPU (works without Mamba)
+CMD ["python3", "neural_memory_long_ppo.py", \
+    "--task", "delayed_cue", \
+    "--controller", "gru", \
+    "--device", "cpu", \
+    "--num-envs", "8"]

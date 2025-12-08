@@ -3,13 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 import os
+import importlib.util
 
 def patch_mamba_for_cpu():
     """
     Patches Mamba 2 to run on CPU/MPS by redirecting CUDA calls to pure PyTorch reference implementations.
     This allows the model to run on Mac and other non-CUDA systems, albeit slower.
+    
+    Safe to call even if mamba_ssm is not installed - will silently return.
     """
+    # Skip if CUDA is available (no patching needed)
     if torch.cuda.is_available():
+        return
+    
+    # Check if mamba_ssm is installed without triggering import
+    # (importing mamba_ssm triggers triton import which would fail)
+    if importlib.util.find_spec("mamba_ssm") is None:
+        # Mamba is not installed - nothing to patch, silently return
         return
 
     print("[*] Mamba Compat: CUDA not available. Patching Mamba 2 for CPU/MPS execution...")
